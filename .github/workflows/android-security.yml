@@ -29,15 +29,39 @@ jobs:
         uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '17.0.21'
       - name: Verify Gradle wrapper integrity
         run: |
           echo '3b8a25775a69158b5ad2b1d17a80a88dc7b40a352a73eb27d06c612a7ce68e98  android/gradle/wrapper/gradle-wrapper.jar' | sha256sum --check --strict
-      - name: Install the required SDK packages
-        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
+      - name: Install pinned Android command-line tools
+        run: |
+          sdk_root="$RUNNER_TEMP/robin-android-sdk"
+          tools_zip="$RUNNER_TEMP/robin-android-command-line-tools.zip"
+          curl --fail --location --retry 3 --proto '=https' --tlsv1.2 \
+            --output "$tools_zip" \
+            https://dl.google.com/android/repository/commandlinetools-linux-16111833_latest.zip
+          # Command-line tools 23, checked against Google's repository metadata.
+          printf '%s  %s\n' '0877a1d048fe4a24efe2eff536ca4223f7adeb58648bb81909d33c446918cfa8' "$tools_zip" | sha256sum --check --strict
+          mkdir -p "$sdk_root/cmdline-tools"
+          unzip -q "$tools_zip" -d "$sdk_root/cmdline-tools"
+          mv "$sdk_root/cmdline-tools/cmdline-tools" "$sdk_root/cmdline-tools/latest"
+          printf 'ANDROID_HOME=%s\nANDROID_SDK_ROOT=%s\n' "$sdk_root" "$sdk_root" >> "$GITHUB_ENV"
+          printf '%s\n' "$sdk_root/cmdline-tools/latest/bin" "$sdk_root/platform-tools" >> "$GITHUB_PATH"
+      - name: Accept SDK licenses and install the required packages
+        run: |
+          python3 - <<'PY'
+          import os
+          import subprocess
+          from pathlib import Path
+          sdk_root = Path(os.environ["ANDROID_SDK_ROOT"])
+          sdkmanager = sdk_root / "cmdline-tools/latest/bin/sdkmanager"
+          base = [str(sdkmanager), f"--sdk_root={sdk_root}"]
+          subprocess.run(base + ["--licenses"], input="y\n" * 100, text=True, check=True)
+          subprocess.run(base + ["platforms;android-36", "build-tools;36.0.0", "platform-tools"], check=True)
+          PY
       - name: Test, lint and build the default feed-only app
         working-directory: android
-        run: ./gradlew --no-daemon --stacktrace :app:testDebugUnitTest :app:lintDebug :app:assembleDebug :app:assembleRelease
+        run: ./gradlew --no-daemon --stacktrace :app:testDebugUnitTest :app:lintDebug :app:lintRelease :app:assembleDebug :app:assembleRelease
       - name: Inspect the packaged Release security properties
         run: |
           python3 scripts/verify-android-release.py \
