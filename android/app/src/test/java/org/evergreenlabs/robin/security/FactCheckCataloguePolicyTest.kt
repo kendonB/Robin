@@ -25,6 +25,21 @@ class FactCheckCataloguePolicyTest {
     }
 
     @Test
+    fun excessRowsAndDepthNeverReachTheAllocatingDecoder() {
+        val tooManyRows = "[" + "{},".repeat(FactCheckCataloguePolicy.MAX_ROWS) + "{}]"
+        val tooDeep = "[".repeat(FactCheckJsonPolicy.MAX_DEPTH + 1) + "0" +
+            "]".repeat(FactCheckJsonPolicy.MAX_DEPTH + 1)
+        for (document in listOf(tooManyRows, tooDeep, "{}", "[] []")) {
+            assertThrows(IllegalStateException::class.java) {
+                FactCheckCataloguePolicy.decodeBounded(document) {
+                    throw AssertionError("The JSON decoder must not run for a rejected document")
+                }
+            }
+        }
+        assertTrue(FactCheckCataloguePolicy.decodeBounded("[{}]") { it == "[{}]" })
+    }
+
+    @Test
     fun anUnknownLengthResponseStillCannotExceedTheByteLimit() {
         val allowed = ByteArray(FactCheckCataloguePolicy.MAX_BYTES) { (it % 251).toByte() }
         assertArrayEquals(allowed, FactCheckCataloguePolicy.readBounded(ByteArrayInputStream(allowed), 100, nowNanos = { 0 }))

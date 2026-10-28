@@ -22,6 +22,7 @@
     <application
         android:name=".RobinApplication"
         android:allowBackup="false"
+        android:allowCrossUidActivitySwitchFromBelow="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="false"
         android:enableOnBackInvokedCallback="true"

@@ -2,6 +2,7 @@ package org.evergreenlabs.robin.security
 
 import android.content.Context
 import android.view.MotionEvent
+import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
@@ -16,6 +17,8 @@ class HardenedWebView(context: Context) : WebView(context) {
     var isResettingSession: Boolean = false
         internal set
     internal var onSessionBlankCommitted: (() -> Unit)? = null
+    var isReleased: Boolean = false
+        private set
 
     init {
         filterTouchesWhenObscured = true
@@ -26,9 +29,25 @@ class HardenedWebView(context: Context) : WebView(context) {
         return event.flags and obscuredFlags == 0 && super.onFilterTouchEventForSecurity(event)
     }
 
+    /** A renderer callback and Compose disposal may both release the same view. */
+    fun release(rendererGone: Boolean = false) {
+        if (isReleased) return
+        isReleased = true
+        onSessionBlankCommitted = null
+        // Never ask a dead renderer to stop or change its settings. Cleanup
+        // steps are independent so one failed call cannot skip destruction.
+        if (!rendererGone) {
+            runCatching { settings.javaScriptEnabled = false }
+            runCatching { stopLoading() }
+        }
+        runCatching { (parent as? ViewGroup)?.removeView(this) }
+        runCatching { removeAllViews() }
+        runCatching { destroy() }
+    }
+
     /** Only an app-initiated reset can use an about:blank main document. */
     fun completeSessionResetIfBlank(url: String?): Boolean {
-        if (!isResettingSession || url != "about:blank") return false
+        if (isReleased || !isResettingSession || url != "about:blank") return false
         val complete = onSessionBlankCommitted
         onSessionBlankCommitted = null
         complete?.invoke()

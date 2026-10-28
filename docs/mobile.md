@@ -8,6 +8,7 @@ The Android app embeds X with local feed filters. This fork hardens that session
 - Android Studio compatible with the pinned Android Gradle Plugin (if using the IDE).
 - Device **API 33+** with an up-to-date system WebView.
 - Python 3 for the Release APK verification script.
+- Node.js 18+ for the shipped-JavaScript security fixtures (built-in modules only).
 
 Gradle, AGP, Kotlin and resolved dependency versions are pinned in the repository. Use the checked-in wrapper with dependency verification enabled.
 
@@ -31,6 +32,8 @@ For AI, explicitly set `robin.enableAi=true` and add your own `android/app/googl
 ## Verify the build
 
 ```bash
+node scripts/test-android-filter-security.mjs
+python3 scripts/test_android_release_verifier.py --sdk "$ANDROID_SDK_ROOT"
 cd android
 APP_CHECK_DEBUG_TOKEN=ROBIN_RELEASE_TOKEN_MUST_NOT_SHIP ./gradlew --no-daemon testDebugUnitTest lintRelease assembleDebug assembleRelease
 cd ..

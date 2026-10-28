@@ -59,6 +59,10 @@ jobs:
           subprocess.run(base + ["--licenses"], input="y\n" * 100, text=True, check=True)
           subprocess.run(base + ["platforms;android-36", "build-tools;36.0.0", "platform-tools"], check=True)
           PY
+      - name: Test packaged-APK verifier against adversarial resource fixtures
+        run: python3 scripts/test_android_release_verifier.py --sdk "$ANDROID_SDK_ROOT"
+      - name: Test Android feed-filter boundaries against hostile page fixtures
+        run: node scripts/test-android-filter-security.mjs
       - name: Test, lint and build the default feed-only app
         working-directory: android
         run: ./gradlew --no-daemon --stacktrace :app:testDebugUnitTest :app:lintDebug :app:lintRelease :app:assembleDebug :app:assembleRelease
@@ -67,8 +71,10 @@ jobs:
           python3 scripts/verify-android-release.py \
             --apk android/app/build/outputs/apk/release/app-release-unsigned.apk \
             --apkanalyzer "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/apkanalyzer" \
-            --forbidden-token ROBIN_RELEASE_TOKEN_MUST_NOT_SHIP
-      - name: Compile the optional AI path with nonfunctional test configuration
+            --forbidden-token ROBIN_RELEASE_TOKEN_MUST_NOT_SHIP \
+            > android/app/build/reports/release-verification-default.json
+          cat android/app/build/reports/release-verification-default.json
+      - name: Compile and inspect the optional AI path with nonfunctional test configuration
         working-directory: android
         run: |
           trap 'rm -f app/google-services.json' EXIT
@@ -92,7 +98,13 @@ jobs:
           Path("app/google-services.json").write_text(json.dumps(config))
           PY
           ./gradlew --no-daemon --stacktrace -Probin.enableAi=true \
-            :app:compileDebugKotlin :app:compileReleaseKotlin
+            :app:compileDebugKotlin :app:assembleRelease
+          python3 ../scripts/verify-android-release.py \
+            --apk app/build/outputs/apk/release/app-release-unsigned.apk \
+            --apkanalyzer "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/apkanalyzer" \
+            --forbidden-token ROBIN_RELEASE_TOKEN_MUST_NOT_SHIP \
+            > app/build/reports/release-verification-ai.json
+          cat app/build/reports/release-verification-ai.json
       - name: Keep test and lint evidence
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
@@ -102,6 +114,7 @@ jobs:
             android/app/build/reports/tests/
             android/app/build/reports/lint-results-*.html
             android/app/build/reports/lint-results-*.xml
+            android/app/build/reports/release-verification-*.json
             android/app/build/outputs/logs/manifest-merger-*.txt
           if-no-files-found: ignore
           retention-days: 7

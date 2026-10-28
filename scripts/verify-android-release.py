@@ -17,6 +17,7 @@ from pathlib import Path
 
 
 ANDROID = "{http://schemas.android.com/apk/res/android}"
+PACKAGE = "org.evergreenlabs.robin"
 DATA_DOMAINS = {
     "root", "file", "database", "sharedpref", "external",
     "device_root", "device_file", "device_database", "device_sharedpref",
@@ -52,6 +53,18 @@ def qualified(package, name):
     return name
 
 
+def contains_known_marker(stream, markers):
+    """Scan bounded chunks while retaining markers split across read boundaries."""
+    overlap = max(len(marker) for marker in markers) - 1
+    tail = b""
+    while chunk := stream.read(64 * 1024):
+        data = tail + chunk
+        if any(marker in data for marker in markers):
+            return True
+        tail = data[-overlap:] if overlap else b""
+    return False
+
+
 def policy_files(aapt2, apk, app):
     """Bind checked XML bytes to the manifest references after resource shrinking."""
     result = subprocess.run([str(aapt2), "dump", "resources", str(apk)],
@@ -60,7 +73,7 @@ def policy_files(aapt2, apk, app):
         "network_security_config": "networkSecurityConfig",
         "data_extraction_rules": "dataExtractionRules",
     }
-    records = {name: {"ids": set(), "files": set(), "configs": set()} for name in expected}
+    records = {name: {"ids": set(), "values": []} for name in expected}
     current = None
     for line in result.stdout.splitlines():
         resource = re.match(r"\s*resource\s+(0x[0-9a-fA-F]+)\s+(\S+)", line)
@@ -71,22 +84,27 @@ def policy_files(aapt2, apk, app):
             if current:
                 records[current]["ids"].add(resource_id.lower())
         elif current:
-            value = re.match(r"\s*\(([^)]*)\)\s+\(file\)\s+(\S+)\s+type=XML", line)
+            # Resource values can also be aliases, including qualified aliases.
+            # Ignoring those would inspect a safe default file while Android
+            # selects a different policy on some devices.
+            value = re.match(r"\s*\(([^)]*)\)\s+(.+)", line)
             if value:
-                config, filename = value.groups()
-                records[current]["configs"].add(config)
-                records[current]["files"].add(filename)
+                records[current]["values"].append(value.groups())
     files = {}
     for name, attribute in expected.items():
         record = records[name]
-        require(len(record["ids"]) == 1 and len(record["files"]) == 1,
+        require(len(record["ids"]) == 1 and bool(record["values"]),
                 "Cannot resolve the packaged " + name + " policy")
-        require(record["configs"] == {""}, "Review configuration-specific " + name + " overrides")
+        require(all(config == "" for config, _ in record["values"]),
+                "Review configuration-specific " + name + " overrides")
+        require(len(record["values"]) == 1, "Expected one packaged " + name + " policy")
+        filename = re.fullmatch(r"\(file\)\s+(\S+)\s+type=XML", record["values"][0][1])
+        require(filename is not None, "Review aliases or unresolved values for " + name)
         resource_id = next(iter(record["ids"]))
         reference = app.get(ANDROID + attribute, "")
         require(reference in {"@ref/" + resource_id, "@" + resource_id, "@xml/" + name},
                 "Manifest does not use the inspected " + name + " policy")
-        files[name] = next(iter(record["files"]))
+        files[name] = filename.group(1)
     return files
 
 
@@ -105,7 +123,18 @@ def main():
     require(len(args.forbidden_token) >= 16, "Use a distinctive non-secret test token")
 
     manifest = decode_xml(args.apkanalyzer, args.apk)
-    package = manifest.attrib["package"]
+    require(manifest.tag == "manifest", "APK manifest has an unexpected root")
+    package = manifest.get("package")
+    require(package == PACKAGE, "APK package is not " + PACKAGE)
+    sdk = manifest.find("uses-sdk")
+    require(sdk is not None, "APK does not declare its supported Android versions")
+    minimum_sdk = sdk.get(ANDROID + "minSdkVersion", "")
+    target_sdk = sdk.get(ANDROID + "targetSdkVersion", "")
+    require(minimum_sdk.isdecimal() and int(minimum_sdk) >= 33,
+            "Release APK must require Android API 33 or newer")
+    require(target_sdk.isdecimal() and int(target_sdk) >= 36,
+            "Release APK must retain its reviewed target SDK of at least 36")
+    require(len(manifest.findall("application")) == 1, "APK must declare one application")
     app = manifest.find("application")
     require(app is not None, "APK has no application")
     require(app.get(ANDROID + "debuggable", "false") == "false", "Release APK is debuggable")
@@ -113,6 +142,8 @@ def main():
     require(app.get(ANDROID + "allowBackup") == "false", "Backups are enabled")
     require(app.get(ANDROID + "fullBackupContent") == "false", "Legacy backups are not explicitly disabled")
     require(app.get(ANDROID + "usesCleartextTraffic") == "false", "Cleartext traffic is not explicitly disabled")
+    require(app.get(ANDROID + "allowCrossUidActivitySwitchFromBelow") == "false",
+            "Cross-UID activity-switch opt-in is missing")
     require(app.get(ANDROID + "networkSecurityConfig") is not None, "Missing network security policy")
     require(app.get(ANDROID + "dataExtractionRules") is not None, "Missing device-transfer exclusion policy")
 
@@ -134,45 +165,60 @@ def main():
     for component in app:
         if component.tag not in {"activity", "activity-alias", "service", "receiver", "provider"}:
             continue
-        name = qualified(package, component.get(ANDROID + "name", ""))
+        raw_name = component.get(ANDROID + "name", "")
+        require(bool(raw_name) and not raw_name.startswith("@"), "Component name must be a literal class name")
+        name = qualified(package, raw_name)
         require(name != "com.google.firebase.provider.FirebaseInitProvider", "Firebase auto-initialises on app start")
         require(not name.startswith(("io.sentry.", "com.aptabase.")), "Telemetry component is packaged")
         implicit_export = component.find("intent-filter") is not None
-        is_exported = component.get(ANDROID + "exported", str(implicit_export).lower()) == "true"
+        explicit_export = component.get(ANDROID + "exported")
+        require(explicit_export in {None, "true", "false"},
+                "Component exported flag must be a literal boolean: " + name)
+        is_exported = explicit_export == "true" if explicit_export is not None else implicit_export
         if is_exported:
             exported.append(name)
             # AndroidX's profile installer is restricted by a platform signature
             # permission; it is not available to another ordinary app.
             protected_profile_receiver = (
-                name == "androidx.profileinstaller.ProfileInstallReceiver"
+                component.tag == "receiver"
+                and name == "androidx.profileinstaller.ProfileInstallReceiver"
                 and component.get(ANDROID + "permission") == "android.permission.DUMP"
             )
-            require(name == "org.evergreenlabs.robin.MainActivity" or protected_profile_receiver,
+            require((component.tag == "activity" and name == PACKAGE + ".MainActivity")
+                    or protected_profile_receiver,
                     "Unexpected exported component: " + name)
 
     policies = policy_files(aapt2, args.apk, app)
     with zipfile.ZipFile(args.apk) as apk:
         names = apk.namelist()
+        require(len(names) == len(set(names)), "APK contains duplicate archive entries")
         require(policies["network_security_config"] in names, "Cannot inspect packaged TLS rules")
         require(policies["data_extraction_rules"] in names, "Cannot inspect packaged backup rules")
         dex_files = [name for name in names if re.fullmatch(r"classes\d*\.dex", name)]
         require(bool(dex_files), "APK has no DEX code")
-        forbidden = (
-            args.forbidden_token.encode(), args.forbidden_token.encode("utf-16le"),
-            args.forbidden_token.encode("utf-16be"), b"Lio/sentry/", b"Lcom/aptabase/",
-            b"Lcom/google/firebase/appcheck/debug/",
-            b"-----BEGIN PRIVATE KEY-----", b"-----BEGIN RSA PRIVATE KEY-----",
-            b"-----BEGIN EC PRIVATE KEY-----",
+        markers = (
+            args.forbidden_token, "Lio/sentry/", "Lcom/aptabase/",
+            "Lcom/google/firebase/appcheck/debug/",
+            "-----BEGIN PRIVATE KEY-----", "-----BEGIN RSA PRIVATE KEY-----",
+            "-----BEGIN EC PRIVATE KEY-----", "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----",
         )
+        forbidden = tuple(dict.fromkeys(
+            marker.encode(encoding)
+            for marker in markers for encoding in ("utf-8", "utf-16le", "utf-16be")
+        ))
         for name in names:
-            require(not name.endswith((".jks", ".keystore", ".p12", ".pfx", ".pem")),
+            require(not name.lower().endswith((".jks", ".keystore", ".p12", ".pfx", ".pem", ".key")),
                     "Private credential file is packaged: " + name)
-            if name in dex_files or name == "resources.arsc" or name.startswith("assets/"):
-                data = apk.read(name)
-                require(not any(value in data for value in forbidden),
-                        "Debug token, telemetry code or private-key material found in " + name)
+            # Raw resources, native libraries and root-level ZIP entries can
+            # also carry tokens or private keys. Inspect every packaged file.
+            if not name.endswith("/"):
+                with apk.open(name) as entry:
+                    require(not contains_known_marker(entry, forbidden),
+                            "Debug token, telemetry code or private-key material found in " + name)
 
     network = decode_xml(args.apkanalyzer, args.apk, policies["network_security_config"])
+    require(network.tag == "network-security-config", "Packaged TLS policy has an unexpected root")
     base = network.find("base-config")
     require(base is not None and base.get("cleartextTrafficPermitted") == "false", "Packaged TLS policy permits cleartext")
     require(network.find("debug-overrides") is None, "Release TLS policy has debug trust overrides")
@@ -181,6 +227,7 @@ def main():
     require(network.find("domain-config") is None, "Review new per-domain TLS exceptions explicitly")
 
     extraction = decode_xml(args.apkanalyzer, args.apk, policies["data_extraction_rules"])
+    require(extraction.tag == "data-extraction-rules", "Packaged backup policy has an unexpected root")
     for kind in ("cloud-backup", "device-transfer"):
         section = extraction.find(kind)
         require(section is not None, "Missing " + kind + " rules")
@@ -195,7 +242,8 @@ def main():
         "permissions": sorted(permissions),
         "exported_components": sorted(exported),
         "dex_files_inspected": len(dex_files),
-        "checks": ["release flags", "merged permissions/components", "no cloud auto-init",
+        "checks": ["package and SDK levels", "release flags", "activity-switch opt-in",
+                   "merged permissions/components", "no cloud auto-init",
                    "no test token/known telemetry or private-key markers", "packaged TLS policy", "packaged backup exclusions"],
     }, indent=2))
 
