@@ -82,7 +82,7 @@ android {
             isMinifyEnabled = true
             isShrinkResources = true
             // Without the owner's keystore, produce an unsigned artifact for inspection.
-            // Never silently sign Release with the public debug key.
+            // Never silently sign Release with a development debug keystore.
             signingConfig = signingConfigs.getByName("release").takeIf { it.storeFile != null }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),

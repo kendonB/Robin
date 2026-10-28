@@ -8,7 +8,7 @@ This is risk reduction, not a guarantee of complete security. Robin still embeds
 
 1. Build a **Release** APK from a reviewed commit. Debug APKs are for development and remain debuggable by Android even though Robin disables WebView inspection in every build.
 2. Leave `robin.enableAi=false` (the default). No Firebase configuration is needed for browsing and filtering X.
-3. Sign the Release APK with a keystore that you create and keep privately. The build never falls back to signing Release with the public Android debug key. An unsigned APK produced for CI inspection cannot be installed until it is signed.
+3. Sign the Release APK with a keystore that you create and keep privately. The build never falls back to signing Release with the development debug keystore. An unsigned APK produced for CI inspection cannot be installed until it is signed.
 4. Keep strong X account authentication enabled. Removing the old WebAuthn-suppression script does not make an arbitrary embedded app a privileged passkey browser. If a sign-in method cannot work within Android/X restrictions, use a supported client instead of weakening account security.
 5. Protect the phone with a screen lock. Do not install an untrusted keyboard, accessibility service or root framework alongside a signed-in account.
 

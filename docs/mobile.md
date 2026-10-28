@@ -39,7 +39,7 @@ python3 scripts/verify-android-release.py \
   --apkanalyzer "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/apkanalyzer"
 ```
 
-Without a private signing configuration the Release APK is deliberately unsigned. The Debug APK is useful for development, but it is Android-debuggable and uses the public debug signing key. Use a privately signed **Release** for your normal signed-in session.
+Without a private signing configuration the Release APK is deliberately unsigned. The Debug APK is useful for development, but it is Android-debuggable and uses the development debug keystore. Use a privately signed **Release** for your normal signed-in session.
 
 ## Sign a personal Release
 
