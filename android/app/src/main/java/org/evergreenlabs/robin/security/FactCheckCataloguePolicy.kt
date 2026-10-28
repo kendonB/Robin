@@ -17,6 +17,14 @@ object FactCheckCataloguePolicy {
     fun acceptsResponse(status: Int, finalUrl: String, contentLength: Long): Boolean =
         status == 200 && finalUrl == FEED_URL && contentLength in -1L..MAX_BYTES.toLong()
 
+    /** Reject allocation-heavy array/depth shapes before invoking a JSON decoder. */
+    fun <T> decodeBounded(text: String, decode: (String) -> T): T {
+        check(text.length <= MAX_BYTES && FactCheckJsonPolicy.acceptsArray(text, MAX_ROWS)) {
+            "Unsupported catalogue structure."
+        }
+        return decode(text)
+    }
+
     fun readBounded(
         input: InputStream,
         deadlineNanos: Long,

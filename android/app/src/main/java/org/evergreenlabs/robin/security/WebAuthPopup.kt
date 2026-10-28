@@ -45,11 +45,15 @@ object WebAuthPopup {
         onBlocked: (String) -> Unit,
         openExternal: (String) -> Unit,
     ): Boolean {
-        if (host == null || !isUserGesture || !WebUrlPolicy.isTrustedMainFrameUrl(host.url)) {
+        if (host == null || (host is HardenedWebView && host.isReleased) ||
+            !isUserGesture || !WebUrlPolicy.isTrustedMainFrameUrl(host.url)
+        ) {
             // A website must not be able to spam native dialogs without a tap.
             return false
         }
-        if (activePopups.containsKey(host) || (host is HardenedWebView && host.isResettingSession)) return false
+        if (activePopups.containsKey(host) ||
+            (host is HardenedWebView && (host.isReleased || host.isResettingSession))
+        ) return false
         val sessionGeneration = (sessionGenerations[host] ?: 0L) + 1L
         sessionGenerations[host] = sessionGeneration
         val message = resultMessage ?: return false
@@ -121,12 +125,7 @@ object WebAuthPopup {
             if (destroyed) return
             destroyed = true
             if (activePopups[host] === closeImmediately) activePopups.remove(host)
-            runCatching {
-                popup.settings.javaScriptEnabled = false
-                popup.stopLoading()
-                root.removeView(popup)
-                popup.destroy()
-            }
+            popup.release()
         }
 
         fun destroyAfterMessages() {
@@ -144,9 +143,9 @@ object WebAuthPopup {
         }
 
         fun block(message: String) {
-            if (closed) return
+            if (closed || popup.isReleased) return
             popup.visibility = View.INVISIBLE
-            popup.stopLoading()
+            runCatching { popup.stopLoading() }
             dismiss()
             onBlocked(message)
         }
@@ -162,7 +161,7 @@ object WebAuthPopup {
         }
 
         fun completeAuth() {
-            if (completionStarted) return
+            if (completionStarted || closed || popup.isReleased) return
             completionStarted = true
             CookieManager.getInstance().flush()
             dismiss()
@@ -170,7 +169,10 @@ object WebAuthPopup {
             var attempts = 0
             val poll = object : Runnable {
                 override fun run() {
-                    if (!host.isAttachedToWindow || (sessionGenerations[host] ?: 0L) != sessionGeneration) return
+                    if (!host.isAttachedToWindow ||
+                        (host is HardenedWebView && (host.isReleased || host.isResettingSession)) ||
+                        (sessionGenerations[host] ?: 0L) != sessionGeneration
+                    ) return
                     CookieManager.getInstance().flush()
                     if (hasSession()) {
                         host.loadUrl("https://x.com/home")
@@ -222,6 +224,7 @@ object WebAuthPopup {
             }
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                if (closed || popup.isReleased) return
                 popup.visibility = View.INVISIBLE
                 if (url == "about:blank" && !trustedDocumentCommitted) return
                 if (!WebUrlPolicy.isTrustedMainFrameUrl(url)) {
@@ -276,8 +279,11 @@ object WebAuthPopup {
             }
 
             override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
-                closeFor(host)
-                onBlocked("The sign-in window stopped. Close it and try again.")
+                (view as? HardenedWebView)?.release(rendererGone = true)
+                if (activePopups[host] === closeImmediately) {
+                    closeFor(host)
+                    onBlocked("The sign-in window stopped. Close it and try again.")
+                }
                 return true
             }
         }

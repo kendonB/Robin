@@ -20,6 +20,8 @@ The app no longer registers `addJavascriptInterface` objects. AndroidX WebKit's 
 
 Bundled feed scripts use the same exact origins and top-frame restriction. They cannot run on an arbitrary `*.x.com` or `*.twitter.com` subdomain. X account pages remain fully privileged web content for that X session; origin checks cannot make a compromised X origin trustworthy.
 
+The Android filter does not automatically click page-wide matches for “new posts”. Native refresh remains available. Automated tab/sort interactions are restricted to recognised feed controls outside post, quote, card and dialog content; compose uses approved controls or a fixed compose route. The shipped Android script has adversarial regression fixtures and intentionally differs from the other platform copies. Replacing it during an upstream sync must preserve those checks.
+
 Top-level navigation and sign-in popups share a strict HTTPS parser and explicit origin policy. Google/Apple authentication hosts are listed individually; broad `googleapis.com`, `gstatic.com` or `google.com` suffix rules have been removed. Popup creation requires a user gesture, unknown destinations are blocked, and the native popup chrome displays the committed origin. There are no native bridges in an authentication popup. An unusual provider redirect may therefore fail closed rather than finish sign-in.
 
 External links are validated absolute HTTPS URLs and are opened by a system browser. Ambiguous authorities, user information, unsafe schemes, local/IP host spellings and unexpected ports are rejected. This is URL validation, not DNS pinning: a public DNS name can still resolve to a local address, and the external browser remains responsible for its network and download policies.
@@ -31,6 +33,8 @@ The X WebView needs JavaScript and local website storage. File/content access, m
 Raw cookies, authentication URLs, page console messages and page-originated error telemetry are not sent to application logs. The Android app contains no Sentry/Aptabase transport or build-time telemetry instrumentation.
 
 The activity and sensitive sheets prohibit screenshots/screen sharing with `FLAG_SECURE`. They hide overlay windows; the activity, native consent/settings dialogs and WebViews reject both fully and partially obscured touches. These controls protect ordinary Android interaction paths, not a compromised operating system or a trusted-but-malicious accessibility service.
+
+The manifest explicitly opts into cross-UID activity-switch restrictions on Android implementations where that platform protection is supported and enabled. Platform compatibility and runtime flags differ, so this is an additional restriction rather than a promise of universal task protection on every supported device.
 
 Cloud backup and device-transfer rules exclude all app-data domains, including the WebView cookie store. The network security configuration explicitly permits only system certificate authorities and denies cleartext traffic. No custom trust-all certificate handler or user-CA exception is installed.
 
@@ -44,7 +48,9 @@ Input and output sizes, external-link counts, JSON nesting and source lists are 
 
 Google Search attribution HTML is displayed only in an inert, offline WebView with an opaque origin. JavaScript, storage, file/content access, network resource loads, popups, forms, downloads and permission requests are blocked. Valid HTTPS suggestion links open in the system browser only after a user action. This retains the provider's attribution display while separating it from the authenticated X view. See [Firebase's grounding requirements](https://firebase.google.com/docs/ai-logic/grounding-google-search).
 
-Publisher credibility data is downloaded from one fixed HTTPS endpoint after an authorised fact-check. Redirects, oversized responses and unbounded catalogue entries are rejected. Robin does not fetch arbitrary article URLs on behalf of page JavaScript.
+If a renderer stops, Robin releases the affected view and blocks reuse of it. Attribution rendering shows a native unavailable message and does not automatically reload the same HTML. A stopped feed renderer requires reopening Robin. Application-level model output checks occur after Firebase's SDK receives/parses its response; they are not a separate raw-transport byte cap inside that SDK.
+
+Publisher credibility data is downloaded from one fixed HTTPS endpoint after an authorised fact-check. Redirects and oversized responses are rejected. Catalogue depth and top-level row counts are checked before deserialisation can allocate the row list, with field and row checks retained afterward. Robin does not fetch arbitrary article URLs on behalf of page JavaScript.
 
 Firebase's automatic initialisation provider is removed. The application initialises Firebase only for an explicitly AI-enabled build. The App Check debug provider has been removed from all Android variants because its SDK can log an attestation bypass token. Debug and Release both use Play Integrity; no App Check debug token is read, generated or stored by this app. The APK verification step also searches for a distinctive test token to catch packaging regressions. Production API restrictions, App Check enforcement and quotas must be configured in **your** Firebase project; a client-side flag cannot enforce a cloud policy. For a sideloaded personal build or a Debug test build, confirm the project's Play Integrity/App Check support before enabling AI. Never solve an attestation failure by distributing a registered debug token in Release.
 
@@ -54,13 +60,15 @@ The Android toolchain is pinned to a patched Gradle release with the official di
 
 Dependencies use explicit versions, checked-in strict lock files and SHA-256 verification metadata. Google-owned/AndroidX groups resolve exclusively from Google's repository; the remaining supported artifacts resolve from Maven Central. JitPack has been removed. Checksums pin the reviewed dependency bytes; they do not independently prove that upstream maintainers or their original publication systems were uncompromised.
 
-The Android CI workflow uses immutable action commit IDs, read-only repository permissions and no persisted checkout credentials. It runs adversarial JVM tests, lint, Debug/Release builds and an inspection of the resulting Release APK. No real X login, Firebase key or signing secret is required for those checks. AI requests themselves are not exercised by CI.
+The Android CI workflow uses immutable action commit IDs, read-only repository permissions and no persisted checkout credentials. It runs shipped-JavaScript fixtures, real AAPT2-compiled verifier fixtures, adversarial JVM tests, lint, Debug/Release builds and inspection of both the default and optional-AI Release APKs. The AI configuration is deliberately nonfunctional. No real X login, Firebase key or signing secret is required for those checks. AI requests themselves are not exercised by CI.
 
-`scripts/verify-android-release.py` uses the official Android SDK `apkanalyzer` to inspect the **packaged** manifest and XML policies, plus APK entries and DEX strings. It rejects debuggable releases, unexpected permissions/exported components, Firebase automatic startup, missing backup/TLS protections, known telemetry packages, private-key file patterns and the test App Check token (including UTF-16 resource strings). These are checks for known markers, not a proof that arbitrary obfuscated code or secrets are absent. Manifest resource references are bound to the XML files actually inspected after resource shrinking. The AndroidX profile installer is permitted only when protected by Android's signature-level `DUMP` permission.
+`scripts/verify-android-release.py` uses the official Android SDK `apkanalyzer` to inspect the **packaged** manifest and XML policies, plus every APK file entry. It rejects debuggable releases, unexpected permissions/exported components, Firebase automatic startup, missing backup/TLS protections, known telemetry packages, private-key file patterns and the test App Check token. All known text markers are scanned in UTF-8 and both UTF-16 byte orders, using bounded reads with overlap. These are checks for known markers, not a proof that arbitrary obfuscated code or secrets are absent. Resource-backed exported flags and policy aliases/configuration overrides require explicit review and are rejected. Manifest resource references are bound to the XML files actually inspected after resource shrinking. The AndroidX profile installer is permitted only when protected by Android's signature-level `DUMP` permission.
 
 Run the same checks locally:
 
 ```bash
+node scripts/test-android-filter-security.mjs
+python3 scripts/test_android_release_verifier.py --sdk "$ANDROID_SDK_ROOT"
 cd android
 APP_CHECK_DEBUG_TOKEN=ROBIN_RELEASE_TOKEN_MUST_NOT_SHIP ./gradlew --no-daemon testDebugUnitTest lintRelease assembleDebug assembleRelease
 cd ..
@@ -76,3 +84,5 @@ Use the actual signed APK path if you supplied a Release signing configuration. 
 JVM tests and compilation cannot prove real OAuth, X page compatibility or Android WebView behaviour. On an up-to-date test device, first verify startup, basic X sign-in with strong authentication, feed filtering, external links, sign-out, blocked popups and the screenshot/overlay controls. In an explicitly AI-enabled test build, check that opening/cancelling a fact-check sends no request and that only native confirmation submits it. Do not include cookies, full authentication URLs, real provider keys or private post content in a bug report.
 
 The hardening changes do not include an authenticated penetration test against X or Google, a proof that no browser-engine vulnerability exists, or changes to the iOS and desktop tools. The source policy and tests should be maintained as X, Android WebView and the build dependencies evolve.
+
+The [second-pass review](android-security-review-2026-10-28-round-2.md) records the additional findings, reproductions, fixes and dependency evidence for version 0.2.32-hardened.

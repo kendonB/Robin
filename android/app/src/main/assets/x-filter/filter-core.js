@@ -287,26 +287,54 @@
   // https://github.com/typefully/minimal-twitter (timeline.js)
   // Mobile Following is Grok-ranked; chronological needs Sort by → Recent.
 
+  // Android security boundary: post text, author names and cards are data,
+  // never evidence that a node is an application control. Keep these checks
+  // in the shipped asset; the iOS copy has its own host and release lifecycle.
+  var POST_CONTENT =
+    "article, [data-testid='tweet'], [data-testid='tweetText'], " +
+    "[data-testid='quoteTweet'], [data-testid='card.wrapper'], " +
+    "[data-testid='User-Name'], [data-testid='cellInnerDiv']";
+  var OVERLAY_ROOTS =
+    "[role='menu'], [role='listbox'], [role='dialog'], [data-testid='Dropdown']";
   var TIMELINE_TABLIST = "div[data-testid='ScrollSnap-List'][role='tablist']";
 
+  function outsidePostContent(el) {
+    return !!(el && el.isConnected && el.closest &&
+      !el.closest(POST_CONTENT) && !el.querySelector(POST_CONTENT));
+  }
+
+  function isFeedChromeControl(el) {
+    return outsidePostContent(el) && !el.closest(OVERLAY_ROOTS) &&
+      !!el.closest('[data-testid="primaryColumn"]');
+  }
+
+  function isTimelineTab(el) {
+    if (!isFeedChromeControl(el) || el.getAttribute("role") !== "tab") return false;
+    var list = el.closest(TIMELINE_TABLIST);
+    if (!list || !isFeedChromeControl(list)) return false;
+    // A tab may be an anchor, but must not navigate to a post-supplied route.
+    var link = el.closest("a[href]");
+    if (link) {
+      var href = link.getAttribute("href");
+      if (href !== "/home" && href !== "/home/") return false;
+    }
+    return true;
+  }
+
   function getTimelineTablist() {
-    return document.querySelector(TIMELINE_TABLIST);
+    var lists = document.querySelectorAll(TIMELINE_TABLIST);
+    for (var i = 0; i < lists.length; i++) {
+      if (isFeedChromeControl(lists[i])) return lists[i];
+    }
+    return null;
   }
 
   function isFollowingLabel(label) {
     if (!label) return false;
     var l = label.toLowerCase().trim();
     return (
-      l === "following" ||
-      l.indexOf("following") !== -1 ||
-      l === "フォロー中" ||
-      l.indexOf("フォロー中") !== -1 ||
-      l === "seguindo" ||
-      l.indexOf("seguindo") !== -1 ||
-      l === "abonnements" ||
-      l.indexOf("abonnements") !== -1 ||
-      l === "siguiendo" ||
-      l.indexOf("siguiendo") !== -1
+      l === "following" || l === "フォロー中" || l === "seguindo" ||
+      l === "abonnements" || l === "siguiendo"
     );
   }
 
@@ -315,8 +343,7 @@
       label === "for you" ||
       label === "おすすめ" ||
       label === "para ti" ||
-      label === "pour vous" ||
-      label.indexOf("for you") !== -1
+      label === "pour vous"
     );
   }
 
@@ -332,22 +359,20 @@
   function findHomeTabs() {
     if (
       cachedHomeTabs.following &&
-      cachedHomeTabs.following.isConnected &&
+      isTimelineTab(cachedHomeTabs.following) &&
       cachedHomeTabs.forYou &&
-      cachedHomeTabs.forYou.isConnected
+      isTimelineTab(cachedHomeTabs.forYou)
     ) {
       return cachedHomeTabs;
     }
 
     var following = null;
     var forYou = null;
-    // Prefer label match — presentation order is only safe on verified mobile tabs.
-    // Wide Mac / tablet layouts can expose other tablists; never click those.
-    var nodes = document.querySelectorAll(
-      "div[role='tab'], a[role='tab'], [role='tab']"
-    );
+    var tablist = getTimelineTablist();
+    var nodes = tablist ? tablist.querySelectorAll("[role='tab']") : [];
     for (var i = 0; i < nodes.length; i++) {
       var t = nodes[i];
+      if (!isTimelineTab(t)) continue;
       var label = tabNodeLabel(t);
       var matchFollow = !following && isFollowingLabel(label);
       var matchForYou = !forYou && isForYouLabel(label);
@@ -365,26 +390,6 @@
       return cachedHomeTabs;
     }
 
-    // Mobile ScrollSnap heuristic only when both labels verify as home tabs.
-    var tablist = getTimelineTablist();
-    if (tablist) {
-      var presentations = tablist.querySelectorAll("div[role='presentation']");
-      if (presentations.length >= 2) {
-        var candForYou =
-          presentations[0].querySelector("div[role='tab'], a[role='tab'], a") ||
-          presentations[0];
-        var candFollowing =
-          presentations[1].querySelector("div[role='tab'], a[role='tab'], a") ||
-          presentations[1];
-        if (
-          isForYouLabel(tabNodeLabel(candForYou)) &&
-          isFollowingLabel(tabNodeLabel(candFollowing))
-        ) {
-          forYou = forYou || candForYou;
-          following = following || candFollowing;
-        }
-      }
-    }
     cachedHomeTabs.following = following;
     cachedHomeTabs.forYou = forYou;
     return cachedHomeTabs;
@@ -400,14 +405,11 @@
   function isFollowingFeedActive() {
     if (!isHomePath()) return false;
 
-    // Check all selected tabs in the home tablist or header
-    var selectedTabs = document.querySelectorAll(
-      "div[data-testid='ScrollSnap-List'][role='tablist'] [role='tab'][aria-selected='true'], " +
-      "div[role='tablist'] [role='tab'][aria-selected='true'], " +
-      "[role='tab'][aria-selected='true']"
-    );
+    var tablist = getTimelineTablist();
+    var selectedTabs = tablist ? tablist.querySelectorAll("[role='tab'][aria-selected='true']") : [];
     if (selectedTabs && selectedTabs.length > 0) {
       for (var i = 0; i < selectedTabs.length; i++) {
+        if (!isTimelineTab(selectedTabs[i])) continue;
         var label = tabNodeLabel(selectedTabs[i]);
         if (isFollowingLabel(label)) {
           return true;
@@ -436,7 +438,7 @@
     if (now - lastFollowClick < 1500) return;
 
     var tabs = findHomeTabs();
-    if (!tabs.following || isTabSelected(tabs.following)) return;
+    if (!isTimelineTab(tabs.following) || isTabSelected(tabs.following)) return;
     // Require a verified Following control — never click a guessed nth tab.
     if (!isFollowingLabel(tabNodeLabel(tabs.following))) return;
     lastFollowClick = now;
@@ -455,7 +457,7 @@
     if (now - lastFollowClick < 1500) return;
 
     var tabs = findHomeTabs();
-    if (!tabs.forYou || isTabSelected(tabs.forYou)) return;
+    if (!isTimelineTab(tabs.forYou) || isTabSelected(tabs.forYou)) return;
     if (!isForYouLabel(tabNodeLabel(tabs.forYou))) return;
     lastFollowClick = now;
     try {
@@ -481,86 +483,91 @@
       .toLowerCase();
   }
 
+  var RECENT_NAMES = ["recent", "most recent", "latest", "最新", "新着", "時系列"];
+  var POPULAR_NAMES = ["popular", "人気"];
+  var SORT_CANCEL_NAMES = ["cancel", "close", "done", "閉じる"];
+  var SORT_CHOICES =
+    "[role='menuitem'], [role='menuitemradio'], [role='option'], [role='button'], button";
+  var pendingSort = null;
+  var lastSortClick = 0;
+
+  function cancelPendingSort() {
+    pendingSort = null;
+    window.__ROBIN_SHEET_BY_US__ = false;
+  }
+
+  // Trusted input, including accessibility clicks, cancels the pending action.
+  // Never select an item from a menu that the user opened in the meantime.
+  ["pointerdown", "keydown", "click"].forEach(function (eventName) {
+    document.addEventListener(eventName, function (event) {
+      if (event.isTrusted) cancelPendingSort();
+    }, true);
+  });
+
+  function findChoiceRow(root, names) {
+    if (!outsidePostContent(root)) return null;
+    var nodes = root.querySelectorAll(SORT_CHOICES);
+    var match = null;
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      if (!outsidePostContent(n) || n.closest("a[href]")) continue;
+      if (n.getAttribute("aria-disabled") === "true" || n.disabled) continue;
+      if (names.indexOf(textOf(n)) === -1) continue;
+      // Ambiguous controls fail closed, including nested clickable wrappers.
+      if (match) return null;
+      match = n;
+    }
+    return match;
+  }
+
   function findSortSheetRoot() {
-    // Mobile "Sort by" sheet: Popular + Recent (+ Cancel).
+    if (!pendingSort) return null;
+    if (!isHomePath() || Date.now() - pendingSort.started > 1500 ||
+        !isFeedChromeControl(pendingSort.opener)) {
+      cancelPendingSort();
+      return null;
+    }
     var layers = document.getElementById("layers");
-    var roots = [];
-    if (layers) roots.push(layers);
-    var menus = document.querySelectorAll(
-      "[role='menu'], [role='listbox'], [data-testid='Dropdown'], [role='dialog']"
-    );
-    for (var i = 0; i < menus.length; i++) roots.push(menus[i]);
+    if (!layers) return null;
+    var roots = layers.querySelectorAll(OVERLAY_ROOTS);
     for (var r = 0; r < roots.length; r++) {
-      var t = textOf(roots[r]);
-      if (
-        (t.indexOf("popular") !== -1 || t.indexOf("人気") !== -1) &&
-        (t.indexOf("recent") !== -1 ||
-          t.indexOf("latest") !== -1 ||
-          t.indexOf("最新") !== -1)
-      ) {
-        return roots[r];
+      var root = roots[r];
+      if (pendingSort.existing.indexOf(root) !== -1 || !outsidePostContent(root)) continue;
+      // A sort popup contains only recognised sort actions, not user content,
+      // profile links or some unrelated account-action menu.
+      if (root.querySelector("a[href], input, textarea, [contenteditable='true']")) continue;
+      var rows = root.querySelectorAll(SORT_CHOICES);
+      if (rows.length < 2 || rows.length > 3) continue;
+      var allowed = true;
+      for (var i = 0; i < rows.length; i++) {
+        var label = textOf(rows[i]);
+        if (POPULAR_NAMES.indexOf(label) === -1 && RECENT_NAMES.indexOf(label) === -1 &&
+            SORT_CANCEL_NAMES.indexOf(label) === -1) allowed = false;
       }
+      if (allowed && findChoiceRow(root, POPULAR_NAMES) && findChoiceRow(root, RECENT_NAMES)) return root;
     }
     return null;
   }
 
-  function findChoiceRow(root, names) {
-    if (!root) return null;
-    var nodes = root.querySelectorAll(
-      "[role='menuitem'], [role='menuitemradio'], [role='option'], [role='button'], button, div[tabindex='0'], span, div"
-    );
-    var exact = null;
-    var prefix = null;
-    for (var i = 0; i < nodes.length; i++) {
-      var n = nodes[i];
-      var t = textOf(n);
-      if (!t || t.length > 48) continue;
-      // Prefer leaf rows whose visible text is exactly the label (not "Sort by Popular Recent").
-      var leaf = (n.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
-      for (var j = 0; j < names.length; j++) {
-        if (leaf === names[j]) {
-          exact =
-            n.closest(
-              "[role='menuitem'], [role='menuitemradio'], [role='option'], [role='button'], button, div[tabindex='0']"
-            ) || n;
-          break;
-        }
-        if (!prefix && (leaf.indexOf(names[j]) === 0 || t === names[j])) {
-          prefix =
-            n.closest(
-              "[role='menuitem'], [role='menuitemradio'], [role='option'], [role='button'], button, div[tabindex='0']"
-            ) || n;
-        }
-      }
-      if (exact) break;
-    }
-    return exact || prefix;
-  }
-
-  function dismissSortSheet(root) {
-    var scope = root || findSortSheetRoot() || document.getElementById("layers");
-    if (!scope) return;
-    var cancel = findChoiceRow(scope, ["cancel", "close", "done", "閉じる"]);
-    if (cancel) {
-      try {
-        cancel.click();
-      } catch (e) {}
-      return;
-    }
+  function openVerifiedSortControl(opener) {
+    if (!isFeedChromeControl(opener) || document.querySelector(OVERLAY_ROOTS)) return false;
+    var now = Date.now();
+    if (now - lastSortClick < 3000) return false;
+    pendingSort = {
+      opener: opener,
+      started: now,
+      existing: Array.prototype.slice.call(document.querySelectorAll(OVERLAY_ROOTS)),
+    };
+    window.__ROBIN_SHEET_BY_US__ = true;
+    lastSortClick = now;
     try {
-      document.dispatchEvent(
-        new KeyboardEvent("keydown", {
-          key: "Escape",
-          code: "Escape",
-          bubbles: true,
-        })
-      );
-    } catch (e2) {}
+      opener.click();
+      return true;
+    } catch (e) {
+      cancelPendingSort();
+      return false;
+    }
   }
-
-  var RECENT_NAMES = ["recent", "most recent", "latest", "最新", "新着", "時系列"];
-
-  var lastSortClick = 0;
 
   function preferLatest() {
     // Port of changeLatestTweets, gated on whether the requested feed is ranked.
@@ -579,8 +586,7 @@
 
     if (ranked === false) {
       window.__ROBIN_LATEST_OK__ = true;
-      if (sheet && window.__ROBIN_SHEET_BY_US__) dismissSortSheet(sheet);
-      window.__ROBIN_SHEET_BY_US__ = false;
+      cancelPendingSort();
       return;
     }
     window.__ROBIN_LATEST_OK__ = false;
@@ -592,49 +598,42 @@
     if (sheet) {
       var recent = findChoiceRow(sheet, RECENT_NAMES);
       if (recent) {
+        cancelPendingSort();
         try {
           recent.click();
         } catch (e) {}
       }
       return;
     }
+    if (pendingSort) return;
 
-    var now = Date.now();
-    if (now - lastSortClick < 3000) return;
-
-    // Desktop: Timeline options / Top Tweets on → first menu item (minimal-twitter).
-    var legacy =
-      document.querySelector("div[aria-label='Timeline options']") ||
-      document.querySelector("div[aria-label='Top Tweets on']");
-    if (legacy) {
-      lastSortClick = now;
-      try {
-        legacy.click();
-      } catch (e2) {}
-      setTimeout(function () {
-        if (findSortSheetRoot()) return;
-        var menuitem = document.querySelector("div[role='menuitem'][tabindex='0']");
-        if (menuitem) {
-          try {
-            menuitem.click();
-          } catch (e3) {}
-        }
-      }, 120);
-      return;
+    // Desktop variants must open the same verified sort menu. Never select
+    // an arbitrary first menu item after a timer.
+    var legacy = document.querySelectorAll(
+      "div[aria-label='Timeline options'], div[aria-label='Top Tweets on']"
+    );
+    for (var i = 0; i < legacy.length; i++) {
+      if (isFeedChromeControl(legacy[i])) {
+        openVerifiedSortControl(legacy[i]);
+        return;
+      }
     }
 
     // Mobile: tapping the selected Following tab (aria-haspopup) opens Sort by.
     var following = tabs.following;
-    if (!following || !isTabSelected(following)) return;
-    var opener = following.getAttribute("aria-haspopup")
-      ? following
-      : following.querySelector && following.querySelector("[aria-haspopup]");
-    if (!opener) return;
-    lastSortClick = now;
-    window.__ROBIN_SHEET_BY_US__ = true;
-    try {
-      opener.click();
-    } catch (e4) {}
+    if (!isTimelineTab(following) || !isTabSelected(following)) return;
+    var popupValues = ["true", "menu", "listbox", "dialog"];
+    var opener = popupValues.indexOf(following.getAttribute("aria-haspopup")) !== -1 ? following : null;
+    if (!opener) {
+      var candidates = following.querySelectorAll("[aria-haspopup]");
+      for (var c = 0; c < candidates.length; c++) {
+        if (popupValues.indexOf(candidates[c].getAttribute("aria-haspopup")) !== -1) {
+          opener = candidates[c];
+          break;
+        }
+      }
+    }
+    if (opener) openVerifiedSortControl(opener);
   }
 
   function shortAge(ms) {
@@ -1032,29 +1031,21 @@
     var selectors = [
       'a[data-testid="FloatingActionButton_compose"]',
       'a[data-testid="SideNav_NewTweet_Button"]',
-      'a[href="/compose/post"]',
-      'a[href="/compose/tweet"]',
-      'a[href="/compose/post/"]',
-      'a[href*="/compose/"]'
     ];
     for (var i = 0; i < selectors.length; i++) {
-      var el = document.querySelector(selectors[i]);
-      if (el) {
+      var controls = document.querySelectorAll(selectors[i]);
+      for (var j = 0; j < controls.length; j++) {
+        var el = controls[j];
+        if (!outsidePostContent(el) || el.closest(OVERLAY_ROOTS)) continue;
+        var href = el.getAttribute("href");
+        if (href !== "/compose/post" && href !== "/compose/tweet" && href !== "/compose/post/") continue;
         el.click();
         return true;
       }
     }
-    var inline = document.querySelector('[data-testid="tweetTextarea_0"]') ||
-                 document.querySelector('div[role="textbox"][contenteditable="true"]');
-    if (inline) {
-      inline.focus();
-      return true;
-    }
-    reportToSentry(
-      "X DOM: No compose button or input found in DOM; falling back to synthetic link",
-      "warning",
-      { tag: "compose_missing_button" }
-    );
+    // A post may link to a prefilled composer. Native New post must use a
+    // fixed route if the actual application control cannot be identified.
+    if (!document.body) return false;
     var a = document.createElement("a");
     a.href = "/compose/post";
     a.style.display = "none";
@@ -1473,8 +1464,9 @@
   }
 
   function onUserTabClick(ev) {
+    if (!ev.isTrusted) return;
     var t = ev.target && ev.target.closest && ev.target.closest('[role="tab"]');
-    if (!t || !isHomePath()) return;
+    if (!isTimelineTab(t) || !isHomePath()) return;
     window.__ROBIN_USER_PICKED_TAB__ = Date.now();
     var label = tabNodeLabel(t);
     if (!isFollowingLabel(label)) {
@@ -1482,176 +1474,11 @@
     }
   }
 
-  /**
-   * Soft-refresh home timeline without a full document reload.
-   * Native hosts call this when near the top (foreground / title tap / Mac poll).
-   * Returns true if a “Show N posts” control was clicked; false ⇒ host should
-   * warm hard-reload. Intentionally does not click Home — that is often a
-   * no-op when already at the top of /home, which hid failed Mac self-refresh.
-   *
-   * Also used by autoClickNewPostsPill — piggybacks on X’s own “Show N posts”
-   * affordance when the site has already detected newer timeline entries.
-   *
-   * TopNavBar / sticky chrome often wraps that pill in display:none, so
-   * discovery must ignore visibility and clickNewPostsControl briefly clears
-   * robin hides + data-mt-reveal-feed-chrome for the click.
-   */
-  function newPostsLabelMatch(label) {
-    if (!label || label.length > 64) return false;
-    return (
-      /^show\s+\d+\s+posts?$/.test(label) ||
-      /^show\s+new\s+posts?$/.test(label) ||
-      /^show\s+\d+\s+post/.test(label) ||
-      /^(see )?new posts?$/.test(label) ||
-      label.indexOf("new posts") !== -1 ||
-      label.indexOf("新しいポスト") !== -1 ||
-      label.indexOf("新しいツイート") !== -1 ||
-      /^ポストを\d+件表示$/.test(label)
-    );
-  }
-
-  function findNewPostsControl() {
-    if (!isHomePath()) return null;
-    var nodes = document.querySelectorAll(
-      '[role="button"], button, a[role="link"], div[role="button"]'
-    );
-    var hidden = null;
-    for (var i = 0; i < nodes.length; i++) {
-      var el = nodes[i];
-      var label = (
-        el.getAttribute("aria-label") ||
-        el.textContent ||
-        ""
-      )
-        .replace(/\s+/g, " ")
-        .trim()
-        .toLowerCase();
-      if (!newPostsLabelMatch(label)) continue;
-      var r = el.getBoundingClientRect();
-      var visible = r.width >= 8 && r.height >= 8 && r.bottom > 0 && r.top < window.innerHeight;
-      if (visible) return el;
-      if (!hidden) hidden = el;
-    }
-    return hidden;
-  }
-
-  function clearRobinHideChain(el) {
-    var restored = [];
-    var p = el;
-    for (var i = 0; i < 16 && p && p !== document.documentElement; i++) {
-      if (p.getAttribute && p.getAttribute("data-mt-robin-hide")) {
-        restored.push({
-          el: p,
-          robinHide: true,
-          display: p.style.getPropertyValue("display"),
-          priority: p.style.getPropertyPriority("display"),
-        });
-        p.style.removeProperty("display");
-        p.removeAttribute("data-mt-robin-hide");
-      }
-      p = p.parentElement;
-    }
-    return restored;
-  }
-
-  function restoreRobinHideChain(restored) {
-    for (var i = 0; i < restored.length; i++) {
-      var item = restored[i];
-      if (item.robinHide) {
-        item.el.setAttribute("data-mt-robin-hide", "1");
-        item.el.style.setProperty("display", "none", "important");
-      }
-    }
-  }
-
-  function clickNewPostsControl(el) {
-    if (!el) return false;
-    var restored = clearRobinHideChain(el);
-    // CSS always hides TopNavBar on home — briefly reveal for the click.
-    var root = document.documentElement;
-    var hadClass = root && root.classList.contains("mt-hide-page-header");
-    if (hadClass) root.classList.remove("mt-hide-page-header");
-    if (root) root.setAttribute("data-mt-reveal-feed-chrome", "1");
-    try {
-      el.click();
-    } catch (e) {
-      if (root) root.removeAttribute("data-mt-reveal-feed-chrome");
-      if (hadClass) root.classList.add("mt-hide-page-header");
-      restoreRobinHideChain(restored);
-      return false;
-    }
-    if (root) root.removeAttribute("data-mt-reveal-feed-chrome");
-    if (hadClass) root.classList.add("mt-hide-page-header");
-    restoreRobinHideChain(restored);
-    // Next tick re-applies chrome hides cleanly.
-    schedule();
-    return true;
-  }
-
-  function feedScrollNearTop() {
-    var roots = [
-      document.scrollingElement,
-      document.documentElement,
-      document.body,
-    ];
-    for (var r = 0; r < roots.length; r++) {
-      var topEl = roots[r];
-      if (topEl && topEl.scrollTop > 80) return false;
-    }
-    var start =
-      document.querySelector('[data-testid="primaryColumn"]') || document.body;
-    if (!start) return true;
-    var ancestor = start;
-    for (var a = 0; a < 8 && ancestor; a++) {
-      if (ancestor.scrollTop > 80) return false;
-      ancestor = ancestor.parentElement;
-    }
-    // Shallow walk only. querySelectorAll("div") materializes every tweet div
-    // and was dominating the main thread further down the feed.
-    var stack = [start];
-    var seen = 0;
-    while (stack.length && seen < 40) {
-      var node = stack.pop();
-      seen++;
-      if (!node || node.nodeType !== 1) continue;
-      if (node.scrollTop > 80) return false;
-      if (node.getAttribute && node.getAttribute("data-testid") === "tweet") continue;
-      var kids = node.children;
-      for (var i = 0; i < kids.length && i < 6; i++) stack.push(kids[i]);
-    }
-    return true;
-  }
-
-  var lastNewPostsClick = 0;
-  function autoClickNewPostsPill() {
-    if (!isHomePath()) return;
-    if (!feedScrollNearTop()) return;
-    var now = Date.now();
-    if (now - lastNewPostsClick < 2500) return;
-    var el = findNewPostsControl();
-    if (!el) return;
-    if (clickNewPostsControl(el)) lastNewPostsClick = now;
-  }
-
+  // Android deliberately leaves text-labelled "new posts" controls alone.
+  // Author names, card titles and links can contain those same words. Native
+  // refresh already loads the fixed /home route under its normal idle gates.
   window.__ROBIN_SOFT_REFRESH_FEED__ = function () {
-    try {
-      if (!isHomePath()) return false;
-
-      var pill = findNewPostsControl();
-      if (pill && clickNewPostsControl(pill)) {
-        lastNewPostsClick = Date.now();
-        return true;
-      }
-
-      // No pill yet. Do not treat a Home-tab click as success: when already
-      // sitting at the top of /home (common on Mac where the window stays
-      // foregrounded), X often no-ops and never surfaces newer posts — the
-      // host must warm hard-reload instead. Home-tap also hid the failure
-      // mode where the Mac near-top poll "ran" but the feed never updated.
-      return false;
-    } catch (e) {
-      return false;
-    }
+    return false;
   };
 
   // --- Boot gate: hide until Following / Latest / chrome work settles ---
@@ -2407,7 +2234,6 @@
     trackViewedPosts();
     updateCaughtUpMarker();
 
-    autoClickNewPostsPill();
     maybeRetryWelcome();
     maybeRevealBoot();
     notePinChrome();

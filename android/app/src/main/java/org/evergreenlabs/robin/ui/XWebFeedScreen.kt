@@ -152,27 +152,9 @@ private val OPEN_COMPOSE_JS = """
     if (typeof window.__ROBIN_OPEN_COMPOSE__ === 'function') {
       return window.__ROBIN_OPEN_COMPOSE__();
     }
-    var selectors = [
-      'a[data-testid="FloatingActionButton_compose"]',
-      'a[data-testid="SideNav_NewTweet_Button"]',
-      'a[href="/compose/post"]',
-      'a[href="/compose/tweet"]',
-      'a[href="/compose/post/"]',
-      'a[href*="/compose/"]'
-    ];
-    for (var i = 0; i < selectors.length; i++) {
-      var el = document.querySelector(selectors[i]);
-      if (el) {
-        el.click();
-        return true;
-      }
-    }
-    var inline = document.querySelector('[data-testid="tweetTextarea_0"]') ||
-                 document.querySelector('div[role="textbox"][contenteditable="true"]');
-    if (inline) {
-      inline.focus();
-      return true;
-    }
+    // Use a fixed route when the scoped filter is absent. A matching link
+    // inside a post may contain attacker-chosen composer text or parameters.
+    if (!document.body) return false;
     var a = document.createElement("a");
     a.href = "/compose/post";
     a.style.display = "none";
@@ -456,7 +438,7 @@ private fun FeedBootCover(visible: Boolean) {
 private fun signOutOfX(webView: WebView?, onFailure: (String) -> Unit) {
     WebAuthPopup.closeFor(webView)
     val hardened = webView as? HardenedWebView
-    if (hardened == null) {
+    if (hardened == null || hardened.isReleased) {
         onFailure("Robin's secure browser is unavailable, so sign-out could not be completed. " +
             "Clear Robin's storage in Android Settings to remove saved sign-in data before using Robin again.")
         return
@@ -465,9 +447,19 @@ private fun signOutOfX(webView: WebView?, onFailure: (String) -> Unit) {
     hardened.isResettingSession = true
     val handler = Handler(Looper.getMainLooper())
     var finished = false
+    fun isActiveReset(): Boolean {
+        if (hardened.isReleased) {
+            finished = true
+            handler.removeCallbacksAndMessages(null)
+        }
+        return !finished
+    }
     fun failClosed() {
-        if (finished) return
+        // A replacement view owns the persisted pending reset after disposal.
+        // Late callbacks from this view must not change its global session gate.
+        if (!isActiveReset()) return
         finished = true
+        handler.removeCallbacksAndMessages(null)
         hardened.isResettingSession = true
         hardened.onSessionBlankCommitted = null
         runCatching { WebViewHardening.recordSessionReset(hardened.context, pending = true) }
@@ -491,13 +483,13 @@ private fun signOutOfX(webView: WebView?, onFailure: (String) -> Unit) {
         check(WebViewHardening.setServiceWorkerNetworkBlocked(true))
         check(WebViewFeature.isFeatureSupported(WebViewFeature.DELETE_BROWSING_DATA))
         hardened.onSessionBlankCommitted = {
-            if (!finished) {
+            if (isActiveReset()) {
                 try {
                     // Unlike legacy WebStorage.deleteAllData, this clears all
                     // website data, including service workers and network cache.
                     // It is not atomic: keep pages and workers offline until done.
                     WebStorageCompat.deleteBrowsingData(WebStorage.getInstance()) {
-                        if (!finished) {
+                        if (isActiveReset()) {
                             try {
                                 CookieManager.getInstance().flush()
                                 if (hardened.isAttachedToWindow) {
@@ -704,18 +696,25 @@ fun XWebFeedScreen(
     }
 
     fun hardReloadFeed(warm: Boolean, markRefresh: Boolean = true) {
-        val wv = webViewRef ?: return
+        val wv = (webViewRef as? HardenedWebView)?.takeUnless {
+            it.isReleased || it.isResettingSession
+        } ?: return
         if (markRefresh) lastFeedRefreshAtMs = System.currentTimeMillis()
         welcomeAutoRetryUsed = false
         warmReloadJob?.cancel()
         warmReloadJob = null
 
         fun doLoad() {
+            if (wv.isReleased || wv.isResettingSession || webViewRef !== wv) return
             // reload() can reuse a cached document; force a network home load.
             val previous = wv.settings.cacheMode
             wv.settings.cacheMode = WebSettings.LOAD_NO_CACHE
             wv.loadUrl(X_HOME)
-            wv.post { wv.settings.cacheMode = previous }
+            wv.post {
+                if (!wv.isReleased && !wv.isResettingSession && webViewRef === wv) {
+                    wv.settings.cacheMode = previous
+                }
+            }
         }
 
         if (warm && wv.width > 0 && wv.height > 0) {
@@ -750,7 +749,9 @@ fun XWebFeedScreen(
      */
     fun retryWelcomeLoad() {
         if (welcomeAutoRetryUsed) return
-        val wv = webViewRef ?: return
+        val wv = (webViewRef as? HardenedWebView)?.takeUnless {
+            it.isReleased || it.isResettingSession
+        } ?: return
         welcomeAutoRetryUsed = true
         Log.i(TAG, "welcome interstitial — reloading home once")
         warmReloadJob?.cancel()
@@ -778,7 +779,11 @@ fun XWebFeedScreen(
         val previous = wv.settings.cacheMode
         wv.settings.cacheMode = WebSettings.LOAD_NO_CACHE
         wv.loadUrl(X_HOME)
-        wv.post { wv.settings.cacheMode = previous }
+        wv.post {
+            if (!wv.isReleased && !wv.isResettingSession && webViewRef === wv) {
+                wv.settings.cacheMode = previous
+            }
+        }
     }
 
     fun flushPendingFeedSettingsReloadIfNeeded() {
@@ -1126,7 +1131,7 @@ fun XWebFeedScreen(
                             WebBridgeScript.TRANSPORT_NAME,
                             WebUrlPolicy.feedOrigins,
                         ) { _, message, sourceOrigin, isMainFrame, _ ->
-                            if (isResettingSession || !WebUrlPolicy.isFeedUrl(this.url) ||
+                            if (isReleased || isResettingSession || !WebUrlPolicy.isFeedUrl(this.url) ||
                                 !WebUrlPolicy.isBridgeOrigin(sourceOrigin.toString(), isMainFrame)
                             ) {
                                 return@addWebMessageListener
@@ -1200,6 +1205,7 @@ fun XWebFeedScreen(
 
                     webChromeClient = object : WebChromeClient() {
                         override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                            if ((view as? HardenedWebView)?.isReleased == true) return
                             progress = newProgress / 100f
                         }
 
@@ -1277,13 +1283,25 @@ fun XWebFeedScreen(
                         }
 
                         override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
-                            webViewRef = null
-                            webViewUnavailable = true
-                            securityNotice = "Robin's browser stopped. Reopen Robin to continue."
+                            if (view === webViewRef) {
+                                clearWarmSnapshot()
+                                activeFactCheck = null
+                                activeBenchmarkCallback.value = null
+                                mainDocumentTrusted = false
+                                showBootCover = false
+                                canGoBack = false
+                                webViewRef = null
+                                webViewUnavailable = true
+                                securityNotice = "Robin's browser stopped. Reopen Robin to continue."
+                            }
+                            // Android reports each affected WebView separately.
+                            WebAuthPopup.closeFor(view)
+                            (view as? HardenedWebView)?.release(rendererGone = true)
                             return true
                         }
 
                         override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                            if ((view as? HardenedWebView)?.isReleased == true) return
                             pageUrl = url
                             mainDocumentTrusted = false
                             view?.visibility = View.INVISIBLE
@@ -1317,6 +1335,7 @@ fun XWebFeedScreen(
                         }
 
                         override fun onPageCommitVisible(view: WebView?, url: String?) {
+                            if ((view as? HardenedWebView)?.isReleased == true) return
                             super.onPageCommitVisible(view, url)
                             if ((view as? HardenedWebView)?.completeSessionResetIfBlank(url) == true) return
                             mainDocumentTrusted = WebUrlPolicy.isTrustedMainFrameUrl(url) &&
@@ -1328,6 +1347,7 @@ fun XWebFeedScreen(
                         }
 
                         override fun onPageFinished(view: WebView?, url: String?) {
+                            if ((view as? HardenedWebView)?.isReleased == true) return
                             if ((view as? HardenedWebView)?.completeSessionResetIfBlank(url) == true) return
                             pageUrl = view?.url
                             if (!WebUrlPolicy.isTrustedMainFrameUrl(url) ||
@@ -1341,6 +1361,12 @@ fun XWebFeedScreen(
                                 if (WebUrlPolicy.isFeedUrl(url)) {
                                     val nonceGen = bootNonceGate.noteNavigationFinished()
                                     it.evaluateJavascript("(function() { $FEED_SCRIPT_GUARD var n=window.__ROBIN_BOOT_NONCE__; return typeof n==='string' && n.length<=128 ? n : ''; })();") { raw ->
+                                        if (it !== webViewRef ||
+                                            (it as? HardenedWebView)?.let { view -> view.isReleased || view.isResettingSession } == true ||
+                                            !WebUrlPolicy.isFeedUrl(it.url)
+                                        ) {
+                                            return@evaluateJavascript
+                                        }
                                         val nonce = raw?.trim()?.removeSurrounding("\"") ?: ""
                                         if (bootNonceGate.onDocumentNonce(nonceGen, nonce)) {
                                             revealBootHolder.value?.invoke()
@@ -1371,6 +1397,7 @@ fun XWebFeedScreen(
                             url: String?,
                             isReload: Boolean,
                         ) {
+                            if ((view as? HardenedWebView)?.isReleased == true || view !== webViewRef) return
                             super.doUpdateVisitedHistory(view, url, isReload)
                             pageUrl = view?.url
                             canGoBack = view?.canGoBack() == true
@@ -1396,6 +1423,7 @@ fun XWebFeedScreen(
                 }
             },
                 update = { view ->
+                    if (view.isReleased) return@AndroidView
                     webViewRef = view
                     canGoBack = view.canGoBack()
                     pageUrl = view.url
@@ -1405,12 +1433,13 @@ fun XWebFeedScreen(
                     // re-toggling zoom/classes on every recomposition (paint churn).
                 },
                 onRelease = { view ->
-                    WebAuthPopup.closeFor(view)
-                    runCatching {
-                        view.stopLoading()
-                        view.destroy()
+                    if (webViewRef === view) {
+                        clearWarmSnapshot()
+                        activeFactCheck = null
+                        webViewRef = null
                     }
-                    if (webViewRef === view) webViewRef = null
+                    WebAuthPopup.closeFor(view)
+                    view.release()
                 },
             )
 

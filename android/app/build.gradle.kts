@@ -47,8 +47,8 @@ android {
         applicationId = "org.evergreenlabs.robin"
         minSdk = 33
         targetSdk = 36
-        versionCode = 60
-        versionName = "0.2.31-hardened"
+        versionCode = 61
+        versionName = "0.2.32-hardened"
         buildConfigField("boolean", "ENABLE_AI", enableAi.toString())
         // Release buildTypes override this to false below.
         buildConfigField("boolean", "SHOW_DEBUG_SETTINGS", "$showDebugSettings")

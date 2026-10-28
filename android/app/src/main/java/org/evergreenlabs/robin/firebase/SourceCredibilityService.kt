@@ -12,7 +12,6 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import org.evergreenlabs.robin.BuildConfig
 import org.evergreenlabs.robin.security.FactCheckCataloguePolicy
-import org.evergreenlabs.robin.security.FactCheckJsonPolicy
 import org.evergreenlabs.robin.security.FactCheckOutputPolicy
 import org.evergreenlabs.robin.security.WebUrlPolicy
 import java.net.URL
@@ -188,8 +187,11 @@ When evaluating those claims, consider:
             }.toString(Charsets.UTF_8)
             // Hosted file may include a UTF-8 BOM that kotlinx.serialization rejects.
             val normalized = body.removePrefix("\uFEFF").trimStart()
-            check(FactCheckJsonPolicy.acceptsNesting(normalized)) { "Unsupported catalogue structure." }
-            val rows = json.decodeFromString<List<MBFCRow>>(normalized)
+            // A small JSON array can contain millions of empty rows. Bound the
+            // count before List deserialization allocates a row object per entry.
+            val rows = FactCheckCataloguePolicy.decodeBounded(normalized) {
+                json.decodeFromString<List<MBFCRow>>(it)
+            }
             check(rows.size <= FactCheckCataloguePolicy.MAX_ROWS) { "Catalogue has too many entries." }
             val index = LinkedHashMap<String, SourceCredibilityRating>(rows.size)
             for (row in rows) {
