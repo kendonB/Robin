@@ -61,6 +61,7 @@ import kotlinx.coroutines.launch
 import org.evergreenlabs.robin.AppConfig
 import org.evergreenlabs.robin.AppGraph
 import org.evergreenlabs.robin.R
+import org.evergreenlabs.robin.security.ProtectDialogWindow
 import org.evergreenlabs.robin.services.FeedRefreshIntervalStore
 import org.evergreenlabs.robin.services.FontScaleStore
 import org.evergreenlabs.robin.xfilter.FilterSettings
@@ -85,6 +86,7 @@ fun InfoSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState,
     ) {
+        ProtectDialogWindow()
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -128,6 +130,27 @@ fun InfoSheet(
             ShowTogglesSection()
             Spacer(modifier = Modifier.height(16.dp))
             HideKeywordsSection()
+            Spacer(modifier = Modifier.height(16.dp))
+            HorizontalDivider()
+            Spacer(modifier = Modifier.height(12.dp))
+            Text(
+                text = stringResource(R.string.privacy),
+                style = MaterialTheme.typography.titleSmall,
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = stringResource(
+                    if (AppConfig.aiEnabled) R.string.privacy_ai_enabled else R.string.privacy_ai_disabled,
+                ),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = stringResource(R.string.privacy_screen_protection),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
             Spacer(modifier = Modifier.height(16.dp))
             if (AppConfig.showDebugSettings) {
                 HorizontalDivider()

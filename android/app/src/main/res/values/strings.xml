@@ -24,8 +24,12 @@
     <string name="about_minimal_twitter">Feed filters adapted from Minimal Theme for Twitter / X by Typefully (MIT).</string>
     <string name="about_minimal_twitter_link">https://github.com/typefully/minimal-twitter</string>
     <string name="about_minimal_twitter_button">Minimal Theme on Github</string>
-    <string name="about_robin_repo_link">https://github.com/billylo1/Robin</string>
+    <string name="about_robin_repo_link">https://github.com/kendonB/Robin</string>
     <string name="about_robin_repo_button">Robin on GitHub</string>
+    <string name="privacy">Privacy</string>
+    <string name="privacy_ai_disabled">AI fact-checking is disabled in this build. Robin sends no analytics or crash reports. X still processes your browsing and account activity.</string>
+    <string name="privacy_ai_enabled">AI fact-checking asks before sending the selected post and links to Google. Robin sends no analytics or crash reports. X still processes your browsing and account activity.</string>
+    <string name="privacy_screen_protection">Screenshots, screen sharing and overlay windows are blocked to protect your signed-in session. Signing out removes the session from this device.</string>
     <string name="user_interface">User Interface</string>
     <string name="filter_settings">Feed filters</string>
     <string name="filter_home_timeline">Home Feed</string>

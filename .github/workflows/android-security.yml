@@ -1,0 +1,83 @@
+name: Android security checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # A public sentinel proves a stray environment token does not enter Release.
+      APP_CHECK_DEBUG_TOKEN: ROBIN_RELEASE_TOKEN_MUST_NOT_SHIP
+    steps:
+      - name: Check out the reviewed source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Set up JDK 17
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Verify Gradle wrapper integrity
+        run: |
+          echo '3b8a25775a69158b5ad2b1d17a80a88dc7b40a352a73eb27d06c612a7ce68e98  android/gradle/wrapper/gradle-wrapper.jar' | sha256sum --check --strict
+      - name: Install the required SDK packages
+        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
+      - name: Test, lint and build the default feed-only app
+        working-directory: android
+        run: ./gradlew --no-daemon --stacktrace :app:testDebugUnitTest :app:lintDebug :app:assembleDebug :app:assembleRelease
+      - name: Inspect the packaged Release security properties
+        run: |
+          python3 scripts/verify-android-release.py \
+            --apk android/app/build/outputs/apk/release/app-release-unsigned.apk \
+            --apkanalyzer "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/apkanalyzer" \
+            --forbidden-token ROBIN_RELEASE_TOKEN_MUST_NOT_SHIP
+      - name: Compile the optional AI path with nonfunctional test configuration
+        working-directory: android
+        run: |
+          trap 'rm -f app/google-services.json' EXIT
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          config = {
+              "project_info": {
+                  "project_number": "123456789012",
+                  "project_id": "robin-security-ci-invalid",
+              },
+              "client": [{
+                  "client_info": {
+                      "mobilesdk_app_id": "1:123456789012:android:0000000000000000000000",
+                      "android_client_info": {"package_name": "org.evergreenlabs.robin"},
+                  },
+                  "api_key": [{"current_key": "not-a-real-api-key"}],
+              }],
+              "configuration_version": "1",
+          }
+          Path("app/google-services.json").write_text(json.dumps(config))
+          PY
+          ./gradlew --no-daemon --stacktrace -Probin.enableAi=true \
+            :app:compileDebugKotlin :app:compileReleaseKotlin
+      - name: Keep test and lint evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: android-security-results
+          path: |
+            android/app/build/reports/tests/
+            android/app/build/reports/lint-results-*.html
+            android/app/build/reports/lint-results-*.xml
+            android/app/build/outputs/logs/manifest-merger-*.txt
+          if-no-files-found: ignore
+          retention-days: 7

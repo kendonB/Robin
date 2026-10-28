@@ -1,56 +1,23 @@
 package org.evergreenlabs.robin
 
-import android.content.BroadcastReceiver
-import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
 import android.os.Bundle
-import android.util.Log
+import android.view.MotionEvent
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.material3.Surface
-import androidx.core.content.ContextCompat
 import org.evergreenlabs.robin.ui.RootScreen
 import org.evergreenlabs.robin.ui.theme.RobinTheme
-import java.util.Locale
 
 class MainActivity : ComponentActivity() {
-
-    private val benchmarkReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == "org.evergreenlabs.robin.RUN_BENCHMARK") {
-                Log.i("RobinBenchmark", "Broadcast received: running in-app benchmark...")
-                AppGraph.benchmark.runBenchmark { result ->
-                    if (result != null) {
-                        val delta = result.deltaVs(AppGraph.benchmark.baselineResult.value)
-                        Log.i(
-                            "RobinBenchmark",
-                            "BENCHMARK_RESULT: initialLoad=${result.initialLoadMs}ms (delta: ${String.format(Locale.US, "%+.1f", delta.initialLoadPct)}%), " +
-                            "scrollRenderCompletion=${result.scrollRenderCompletionMs}ms (delta: ${String.format(Locale.US, "%+.1f", delta.scrollRenderPct)}%), " +
-                            "bootReady=${result.bootReady}, isRegressed=${delta.isRegressed}"
-                        )
-                    } else {
-                        Log.e("RobinBenchmark", "BENCHMARK_RESULT: failed (null result)")
-                    }
-                }
-            }
-        }
-    }
-
     override fun onCreate(savedInstanceState: Bundle?) {
-        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
-
-        if (BuildConfig.DEBUG) {
-            val filter = IntentFilter("org.evergreenlabs.robin.RUN_BENCHMARK")
-            ContextCompat.registerReceiver(
-                this,
-                benchmarkReceiver,
-                filter,
-                ContextCompat.RECEIVER_EXPORTED,
-            )
-        }
+        // The screen can contain an authenticated X session or a password.
+        // This also keeps its contents out of Android's recent-apps snapshot.
+        window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        window.setHideOverlayWindows(true)
+        enableEdgeToEdge()
 
         setContent {
             RobinTheme {
@@ -61,12 +28,12 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        if (BuildConfig.DEBUG) {
-            try {
-                unregisterReceiver(benchmarkReceiver)
-            } catch (_: Exception) {}
-        }
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        // Consume both fully and partially obscured touches. In particular, an
+        // overlay must not be able to trick a tap on native AI confirmation.
+        val obscured = MotionEvent.FLAG_WINDOW_IS_OBSCURED or
+            MotionEvent.FLAG_WINDOW_IS_PARTIALLY_OBSCURED
+        if (event.flags and obscured != 0) return true
+        return super.dispatchTouchEvent(event)
     }
 }

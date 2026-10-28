@@ -3,6 +3,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 > Unofficial project. Not affiliated with, endorsed by, or sponsored by X Corp. or Twitter.
 
+**Personal Android fork:** start with [the Android security and build guide](docs/android-security.md). Android AI is disabled by default, requests require native confirmation when enabled, and Android telemetry has been removed. Build this fork's Release variant for these protections; the upstream store links below refer to separate binaries. The security changes cover Android; iOS and desktop retain upstream behaviour.
+
 <p>
   <a href="https://apps.apple.com/us/app/robin-non-algorithmic-x/id6817063233"><img src="https://tools.applemediaservices.com/api/badges/download-on-the-app-store/black/en-us?size=250x83" alt="Download on the App Store" height="40"></a>
   &nbsp;
@@ -48,10 +50,10 @@ I hope Robin helps you stay informed without the mental exhaustion of sorting th
 - Hide promoted posts, page chrome, compose prompts, and related clutter
 - Keyword filtering to hide posts containing specified words or phrases
 - In-feed "You're all caught up" divider marking where you left off last visit to reduce doomscrolling
-- Long-press any post to fact-check claims with generative AI and live web search evidence
+- Long-press a post to request AI fact-checking (Android requires explicit build opt-in and per-request confirmation)
 - Text size controls
 - Sign out clears the X WebView cookie session
-- Optional Sentry and Aptabase (off unless you configure them locally)
+- Android has no Sentry or Aptabase; iOS retains its optional configuration
 
 ## Stack
 
@@ -67,7 +69,7 @@ I hope Robin helps you stay informed without the mental exhaustion of sorting th
 | iOS | [docs/mobile.md](docs/mobile.md#ios-client) |
 | Store builds | Homebrew Fastlane (`fastlane/`) — see Fastfile |
 
-Quick Android debug build:
+Quick Android development build (use a privately signed Release build for your primary account):
 
 ```bash
 cp android/local.properties.example android/local.properties

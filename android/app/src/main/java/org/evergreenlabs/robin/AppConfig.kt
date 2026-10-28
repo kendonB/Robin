@@ -1,6 +1,9 @@
 package org.evergreenlabs.robin
 
 object AppConfig {
+    val aiEnabled: Boolean
+        get() = BuildConfig.ENABLE_AI
+
     val versionName: String
         get() = BuildConfig.VERSION_NAME
 

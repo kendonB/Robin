@@ -1,14 +1,8 @@
-sdk.dir=/Users/YOU/Library/Android/sdk
-# Optional — leave blank to disable Sentry
-sentry.dsn=
-# Optional Aptabase (self-hosted or cloud). Leave blank to disable (recommended for forks).
-# aptabase.appKey=A-SH-YOUR_APP_KEY
-# aptabase.host=https://YOUR_APTABASE_HOST
-aptabase.appKey=
-aptabase.host=
-# Optional App Check debug token for local development (leave blank to generate dynamically)
-# appcheck.debugToken=YOUR_DEBUG_TOKEN
-appcheck.debugToken=
-# Debug Settings chrome (benchmark). Default true in debug builds; set false for release-looking screen recordings.
-# robin.showDebugSettings=false
+sdk.dir=/absolute/path/to/Android/sdk
+# Default personal build: feed reader only; no Firebase configuration is needed.
+robin.enableAi=false
+# To opt into fact checking, set true and supply your own app/google-services.json.
+# Configure Firebase App Check enforcement, key restrictions and service quotas first.
+# Both Debug and Release use Play Integrity; no debug attestation bypass is supported.
+# Debug-only benchmark controls; Release always disables them.
 robin.showDebugSettings=true

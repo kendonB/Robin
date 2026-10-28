@@ -2,34 +2,23 @@ package org.evergreenlabs.robin.ui
 
 import android.annotation.SuppressLint
 import android.app.Activity
-import android.app.Dialog
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
-import android.graphics.Color
 import android.graphics.Rect
-import android.graphics.Typeface
-import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import android.os.Message
 import android.os.SystemClock
-import android.os.VibrationEffect
-import android.os.Vibrator
-import org.json.JSONObject
 import android.util.Log
-import android.util.TypedValue
-import android.view.Gravity
 import android.view.InputDevice
 import android.view.MotionEvent
 import android.view.PixelCopy
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
-import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -37,13 +26,15 @@ import android.webkit.WebSettings
 import android.webkit.WebStorage
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.webkit.RenderProcessGoneDetail
+import android.webkit.SafeBrowsingResponse
+import android.webkit.SslErrorHandler
+import android.webkit.WebResourceResponse
+import android.webkit.PermissionRequest
+import android.net.http.SslError
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
-import io.sentry.Sentry
-import io.sentry.SentryLevel
-import android.widget.FrameLayout
-import android.widget.LinearLayout
-import android.widget.TextView
+import androidx.webkit.WebStorageCompat
 import androidx.activity.compose.BackHandler
 import androidx.browser.customtabs.CustomTabColorSchemeParams
 import androidx.browser.customtabs.CustomTabsIntent
@@ -77,6 +68,7 @@ import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.KeyboardArrowUp
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -114,7 +106,6 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.core.graphics.drawable.toDrawable
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -126,6 +117,15 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
 import org.evergreenlabs.robin.Analytics
 import org.evergreenlabs.robin.AppGraph
+import org.evergreenlabs.robin.BuildConfig
+import org.evergreenlabs.robin.security.HardenedWebView
+import org.evergreenlabs.robin.security.WebAuthPopup
+import org.evergreenlabs.robin.security.WebBridgeRateLimiter
+import org.evergreenlabs.robin.security.WebBridgeScript
+import org.evergreenlabs.robin.security.WebNativeMessage
+import org.evergreenlabs.robin.security.WebNativeMessagePolicy
+import org.evergreenlabs.robin.security.WebUrlPolicy
+import org.evergreenlabs.robin.security.WebViewHardening
 import org.evergreenlabs.robin.R
 import org.evergreenlabs.robin.ui.theme.RobinCream
 import org.evergreenlabs.robin.ui.theme.RobinHeaderDark
@@ -134,8 +134,6 @@ import org.evergreenlabs.robin.ui.theme.RobinRedLight
 import org.evergreenlabs.robin.xfilter.FilterSettings
 import org.evergreenlabs.robin.xfilter.XFilterInjector
 import org.evergreenlabs.robin.services.FeedRefreshIntervalStore
-import java.net.URLDecoder
-import java.util.Locale
 
 private const val TAG = "XWebFeed"
 private const val X_HOME = "https://x.com/home"
@@ -143,8 +141,13 @@ private const val NEAR_TOP_PX = 80
 private const val SCROLL_TOP_BUTTON_PX = 400
 private const val WARM_CROSSFADE_MS = 450
 
+// Recheck inside each script as navigation can race an evaluateJavascript call.
+private val FEED_SCRIPT_GUARD =
+    "if(window.top!==window||${WebUrlPolicy.feedOrigins.joinToString(",", "[", "]") { "'$it'" }}.indexOf(location.origin)===-1)return;"
+
 private val OPEN_COMPOSE_JS = """
 (function() {
+  $FEED_SCRIPT_GUARD
   try {
     if (typeof window.__ROBIN_OPEN_COMPOSE__ === 'function') {
       return window.__ROBIN_OPEN_COMPOSE__();
@@ -186,6 +189,7 @@ private val OPEN_COMPOSE_JS = """
 /** Reports scrollY from nested X containers (window scroll often stays at 0). */
 private val SCROLL_PROBE_JS = """
 (function(){
+  $FEED_SCRIPT_GUARD
   if (window.__ROBIN_SCROLL_PROBE__) return;
   window.__ROBIN_SCROLL_PROBE__ = true;
   var lastPosted = -1;
@@ -200,10 +204,8 @@ private val SCROLL_PROBE_JS = """
       }
     } catch (e) {}
   }
-  // RobinScroll.post is a synchronous bridge. Calling it every frame stalls
-  // the renderer for the whole fling, so the timeline stays white until the
-  // gesture ends. Post only when the back-to-top / near-top flags change,
-  // then once more when scrolling pauses.
+  // Post only when the back-to-top / near-top flags change, then once more
+  // when scrolling pauses. This keeps native message traffic bounded.
   function report(y) {
     pending = Math.max(0, Math.round(y || 0));
     var show = pending >= 400;
@@ -243,111 +245,6 @@ private val SCROLL_PROBE_JS = """
 })();
 """.trimIndent()
 
-private class ScrollBridge(private val onY: (Int) -> Unit) {
-    private val main = Handler(Looper.getMainLooper())
-
-    @JavascriptInterface
-    fun post(y: Int) {
-        main.post { onY(y) }
-    }
-}
-
-private class InteractBridge(private val onInteract: () -> Unit) {
-    private val main = Handler(Looper.getMainLooper())
-
-    @JavascriptInterface
-    fun post() {
-        main.post { onInteract() }
-    }
-}
-
-/** Called from filter-core when the boot gate lifts (`RobinBoot.ready(nonce)`) or the welcome empty state sticks (`RobinBoot.retry(nonce)`). */
-private class BootBridge(
-    private val onReady: (String) -> Unit,
-    private val onRetry: (String) -> Unit,
-) {
-    private val main = Handler(Looper.getMainLooper())
-
-    @JavascriptInterface
-    fun ready(nonce: String) {
-        main.post { onReady(nonce) }
-    }
-
-    @JavascriptInterface
-    fun retry(nonce: String) {
-        main.post { onRetry(nonce) }
-    }
-}
-
-private class FactCheckBridge(
-    private val onFactCheck: (FactCheckRequest) -> Unit,
-) {
-    private val main = Handler(Looper.getMainLooper())
-
-    @JavascriptInterface
-    fun factCheck(jsonStr: String) {
-        main.post {
-            runCatching {
-                val json = JSONObject(jsonStr)
-                val text = json.optString("text", "").trim()
-                if (text.isEmpty()) return@post
-                val author = json.optString("author").takeIf { it.isNotBlank() }
-                val url = json.optString("url").takeIf { it.isNotBlank() }
-                val linksArray = json.optJSONArray("links")
-                val links = mutableListOf<String>()
-                if (linksArray != null) {
-                    for (i in 0 until linksArray.length()) {
-                        val item = linksArray.optString(i)
-                        if (!item.isNullOrBlank()) links.add(item)
-                    }
-                }
-                onFactCheck(
-                    FactCheckRequest(
-                        text = text,
-                        author = author,
-                        tweetURL = url,
-                        externalLinks = links,
-                    )
-                )
-            }.onFailure { e ->
-                Log.e(TAG, "FactCheckBridge: failed to dispatch fact check request", e)
-            }
-        }
-    }
-}
-
-private class SentryBridge {
-    private val main = Handler(Looper.getMainLooper())
-
-    @JavascriptInterface
-    fun postMessage(jsonStr: String) {
-        main.post {
-            runCatching {
-                val json = JSONObject(jsonStr)
-                val message = json.optString("message", "").trim()
-                if (message.isEmpty()) return@runCatching
-                val levelStr = json.optString("level", "warning").lowercase()
-                val level = if (levelStr == "error") SentryLevel.ERROR else SentryLevel.WARNING
-                val extra = json.optJSONObject("extra")
-                Log.w("RobinSentry", "DOM Diagnostic [$levelStr]: $message ${extra ?: ""}")
-                Sentry.captureMessage(message) { scope ->
-                    scope.level = level
-                    scope.setTag("source", "dom_diagnostic")
-                    extra?.keys()?.forEach { key ->
-                        scope.setExtra(key, extra.opt(key)?.toString() ?: "")
-                    }
-                }
-            }.onFailure { e ->
-                Log.e("RobinSentry", "Failed to forward DOM diagnostic to Sentry", e)
-            }
-        }
-    }
-}
-
-/**
- * After a welcome-state reload, ignore `ready` from the document we left.
- * Filter-core stamps each document with `window.__ROBIN_BOOT_NONCE__`.
- */
 private class BootNonceGate {
     var rejectUntilFresh: Boolean = false
     var liveNonce: String = ""
@@ -399,29 +296,15 @@ private class BootNonceGate {
     }
 }
 
-/** Called from filter-core when the benchmark run settles. */
-private class BenchmarkBridge(private val onResult: (String) -> Unit) {
-    private val main = Handler(Looper.getMainLooper())
-
-    @JavascriptInterface
-    fun post(json: String) {
-        main.post { onResult(json) }
-    }
-}
-
 /** Mobile Chrome — keeps X on the TopNavBar layout (same CSS path as iOS). */
 private const val MOBILE_CHROME_USER_AGENT =
     "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 " +
         "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
 
 private fun isFeedHome(url: String?): Boolean {
-    if (!isXHost(url)) return false
-    return try {
-        val path = android.net.Uri.parse(url).path.orEmpty()
-        path.isEmpty() || path == "/" || path == "/home" || path.startsWith("/home/")
-    } catch (_: Exception) {
-        false
-    }
+    if (!WebUrlPolicy.isFeedUrl(url)) return false
+    val path = url?.let(WebUrlPolicy::parseHttps)?.path.orEmpty()
+    return path.isEmpty() || path == "/" || path == "/home" || path.startsWith("/home/")
 }
 
 /** Feed type / ordering / content filters that need a home reload to fully apply. */
@@ -431,76 +314,12 @@ private fun feedReloadFingerprint(s: FilterSettings): List<Boolean> = listOf(
     s.hideLiveContent,
 )
 
-private fun isXHost(url: String?): Boolean {
-    if (url.isNullOrBlank()) return false
-    val host = android.net.Uri.parse(url).host?.lowercase(Locale.US).orEmpty()
-    return host == "x.com" || host.endsWith(".x.com") ||
-        host == "twitter.com" || host.endsWith(".twitter.com")
-}
-
-private val GOOGLE_OAUTH_CCTLD_REGEX = Regex("""^accounts\.google\.[a-z]{2,3}(\.[a-z]{2})?$""")
-
-/** Matches google.com and regional Google ccTLDs used by OAuth SetSID (e.g. accounts.google.ca, accounts.google.co.uk). */
-private fun isGoogleHost(host: String): Boolean {
-    if (host == "google.com" || host.endsWith(".google.com")) return true
-    if (GOOGLE_OAUTH_CCTLD_REGEX.matches(host)) return true
-    return false
-}
-
-/** Google / Apple OAuth documents that belong in the in-app popup. */
-private fun isOAuthPopupUrl(url: String?): Boolean {
-    if (url.isNullOrBlank()) return false
-    val host = android.net.Uri.parse(url).host?.lowercase(Locale.US).orEmpty()
-    if (host.isEmpty()) return false
-    if (isGoogleHost(host)) return true
-    if (host == "appleid.apple.com" || host.endsWith(".apple.com")) return true
-    if (host == "accounts.youtube.com" || host.endsWith(".youtube.com")) return true
-    if (host.endsWith(".googleusercontent.com") || host.endsWith(".googleapis.com")) return true
-    return false
-}
-
-/**
- * Hosts allowed inside the X WebView (feed + OAuth). Everything else opens
- * in the user’s default browser.
- *
- * Note: `t.co` is intentionally excluded — short links open in the default browser
- * (X opens them via window.open / createWebView).
- */
-private fun isAllowedWebViewUrl(url: String): Boolean {
-    val lower = url.lowercase(Locale.US)
-    if (lower.startsWith("about:") || lower.startsWith("blob:")) return true
-    val uri = try {
-        android.net.Uri.parse(url)
-    } catch (_: Exception) {
-        return false
-    }
-    val scheme = uri.scheme?.lowercase(Locale.US).orEmpty()
-    if (scheme != "http" && scheme != "https") return false
-    val host = uri.host?.lowercase(Locale.US).orEmpty()
-    if (host.isEmpty()) return false
-    if (isGoogleHost(host)) return true
-    val allowedExact = setOf(
-        "x.com", "twitter.com", "api.x.com", "api.twitter.com",
-        "mobile.twitter.com", "mobile.x.com",
-        "accounts.google.com", "appleid.apple.com", "accounts.youtube.com",
-    )
-    if (host in allowedExact) return true
-    val allowedSuffixes = listOf(
-        ".x.com", ".twitter.com",
-        ".google.com", ".googleapis.com", ".gstatic.com", ".youtube.com",
-        ".apple.com", ".cdn-apple.com",
-    )
-    for (suffix in allowedSuffixes) {
-        if (host.endsWith(suffix) || host == suffix.removePrefix(".")) return true
-    }
-    return false
-}
-
-/** Opens http(s) in a Custom Tab (falls back to the default browser). */
-private fun openInDefaultBrowser(context: android.content.Context?, url: String) {
-    if (context == null || url.isBlank()) return
-    val uri = android.net.Uri.parse(url)
-    try {
+/** External browsing always requires a validated HTTPS destination. */
+private fun openInDefaultBrowser(context: Context?, url: String): Boolean {
+    if (context == null) return false
+    val safeUrl = WebUrlPolicy.safeHttpsUrl(url) ?: return false
+    val uri = android.net.Uri.parse(safeUrl)
+    return try {
         val colorScheme = CustomTabColorSchemeParams.Builder()
             .setToolbarColor(RobinRed.toArgb())
             .build()
@@ -511,226 +330,49 @@ private fun openInDefaultBrowser(context: android.content.Context?, url: String)
             .build()
         customTabs.intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         customTabs.launchUrl(context, uri)
-    } catch (e: ActivityNotFoundException) {
-        Log.w(TAG, "Custom Tabs unavailable; falling back to ACTION_VIEW: $url", e)
+        true
+    } catch (_: ActivityNotFoundException) {
         try {
-            val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+            context.startActivity(Intent(Intent.ACTION_VIEW, uri).apply {
                 addCategory(Intent.CATEGORY_BROWSABLE)
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK
-            }
-            context.startActivity(intent)
-        } catch (e2: Exception) {
-            Log.w(TAG, "openInDefaultBrowser failed: $url", e2)
-        }
-    } catch (e: Exception) {
-        Log.w(TAG, "openInDefaultBrowser failed: $url", e)
-    }
-}
-
-/**
- * X mobile shell uses `x-safari-https://…` to bounce into Chrome/Safari.
- * Rewrite to plain https (keeps path/query/fragment).
- */
-private fun rewrittenSafariSchemeUrl(url: String): String? {
-    val lower = url.lowercase(Locale.US)
-    val from = when {
-        lower.startsWith("x-safari-https:") -> "x-safari-https:"
-        lower.startsWith("x-safari-http:") -> "x-safari-http:"
-        else -> return null
-    }
-    val to = if (from.endsWith("https:")) "https:" else "http:"
-    return to + url.substring(from.length)
-}
-
-/**
- * Parse `intent://…#Intent;…;end` into an https URL we can load in-app.
- * Prefer S.browser_fallback_url; else rebuild from scheme + host/path.
- */
-private fun rewrittenIntentUrl(url: String): String? {
-    if (!url.lowercase(Locale.US).startsWith("intent:")) return null
-    try {
-        val intent = Intent.parseUri(url, Intent.URI_INTENT_SCHEME)
-        val fallback = intent.getStringExtra("browser_fallback_url")
-            ?: intent.getStringExtra("S.browser_fallback_url")
-        if (!fallback.isNullOrBlank() &&
-            (fallback.startsWith("http://") || fallback.startsWith("https://"))
-        ) {
-            return fallback
-        }
-        val data = intent.data
-        if (data != null) {
-            val scheme = data.scheme?.lowercase(Locale.US).orEmpty()
-            if (scheme == "http" || scheme == "https") return data.toString()
-        }
-        // intent://host/path#Intent;scheme=https;end → https://host/path
-        val fragmentScheme = intent.scheme?.lowercase(Locale.US)
-        if (fragmentScheme == "http" || fragmentScheme == "https") {
-            val rest = url.removePrefix("intent:").substringBefore("#Intent")
-            return "$fragmentScheme:$rest"
-        }
-    } catch (e: Exception) {
-        Log.w(TAG, "intent parse failed: $url", e)
-    }
-    // Manual fallback_url scrape if Intent.parseUri missed encoded extras.
-    val marker = "S.browser_fallback_url="
-    val idx = url.indexOf(marker)
-    if (idx >= 0) {
-        val raw = url.substring(idx + marker.length).substringBefore(';')
-        return try {
-            URLDecoder.decode(raw, Charsets.UTF_8.name())
+            })
+            true
         } catch (_: Exception) {
-            raw
+            false
         }
+    } catch (_: Exception) {
+        false
     }
-    return null
 }
 
-/**
- * Returns a loadable http(s) URL if [url] is a bounce scheme, else null.
- * Caller should load the result in the WebView and return true from shouldOverride.
- */
-private fun rewrittenInAppUrl(url: String): String? {
-    rewrittenSafariSchemeUrl(url)?.let { return it }
-    rewrittenIntentUrl(url)?.let { return it }
-    return null
-}
-
-/**
- * Handle navigation inside a WebView: rewrite bounce schemes, keep allowlisted
- * http(s) in-app, hand off other web links to Custom Tabs, never hand
- * off to the X app for OAuth nags.
- * @return true if the navigation was consumed (override).
- */
+/** External redirects cannot silently open another app or move outside trusted sites. */
 private fun handleWebNavigation(
     view: WebView?,
     url: String?,
-    isForMainFrame: Boolean = true,
-    isAuthPopup: Boolean = false,
+    isForMainFrame: Boolean,
+    hasUserGesture: Boolean,
+    onBlocked: (String) -> Unit,
 ): Boolean {
-    if (url.isNullOrBlank()) return false
-    val lower = url.lowercase(Locale.US)
-
-    rewrittenInAppUrl(url)?.let { rewritten ->
-        if (!isAuthPopup && !isAllowedWebViewUrl(rewritten)) {
-            Log.i(TAG, "rewrite → browser: $url → $rewritten")
-            openInDefaultBrowser(view?.context, rewritten)
-            return true
+    if (url.isNullOrBlank()) return true
+    if (view is HardenedWebView && view.isResettingSession) return url != "about:blank"
+    if (!isForMainFrame) {
+        // Subframes never receive usable native bridges. X/SSO still need HTTPS
+        // embedded content, including providers with separate iframe origins.
+        return !url.startsWith("https://", ignoreCase = true) && url != "about:blank"
+    }
+    if (WebUrlPolicy.isTrustedMainFrameUrl(url)) return false
+    if (hasUserGesture && WebUrlPolicy.safeHttpsUrl(url) != null) {
+        if (!openInDefaultBrowser(view?.context, url)) {
+            onBlocked("Robin could not open this link in your browser.")
         }
-        Log.i(TAG, "rewrite $url → $rewritten")
-        view?.loadUrl(rewritten)
         return true
     }
-
-    if (lower.startsWith("http://") || lower.startsWith("https://") ||
-        lower.startsWith("about:") || lower.startsWith("blob:")
-    ) {
-        if (!isAuthPopup &&
-            isForMainFrame &&
-            (lower.startsWith("http://") || lower.startsWith("https://")) &&
-            !isAllowedWebViewUrl(url)
-        ) {
-            Log.i(TAG, "open external: $url")
-            openInDefaultBrowser(view?.context, url)
-            return true
-        }
-        return false
-    }
-
-    Log.i(TAG, "blocked external scheme: $url")
+    onBlocked("Robin blocked a page outside its supported secure sites. Open external links directly in your browser.")
     return true
 }
 
-/**
- * Embedded Android WebViews are not on Google Play Services' privileged browser allowlist
- * (`FOR_BROWSER` fails `FetchAllowlistedOriginOperation`, and without `CREDENTIAL_MANAGER_SET_ORIGIN`
- * throws a fatal `SecurityException` across JNI when `x.com` calls `navigator.credentials.get()`),
- * nor in `google.com` / `x.com`'s Digital Asset Links (`FOR_APP` fails `[50152] RP ID cannot be validated`).
- *
- * However, Chromium WebView still exposes `window.PublicKeyCredential` and resolves
- * `isUserVerifyingPlatformAuthenticatorAvailable()` to `true`, which tricks `accounts.google.com`
- * and `x.com` into initiating passkey challenges that cannot succeed in WebView.
- *
- * Suppress `PublicKeyCredential` at document start so both `x.com` and `accounts.google.com`
- * cleanly use password + standard 2FA (Google Prompt, Authenticator, SMS) without crashing or failing.
- */
-private val SUPPRESS_WEBAUTHN_JS = """
-(function(){
-  try {
-    if (window.PublicKeyCredential) {
-      window.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable = function() {
-        return Promise.resolve(false);
-      };
-      window.PublicKeyCredential.isConditionalMediationAvailable = function() {
-        return Promise.resolve(false);
-      };
-      try { delete window.PublicKeyCredential; } catch (e) { window.PublicKeyCredential = undefined; }
-    }
-    if (navigator.credentials) {
-      var origGet = navigator.credentials.get;
-      if (origGet) {
-        navigator.credentials.get = function(opts) {
-          if (opts && opts.publicKey) {
-            return Promise.reject(new DOMException('Passkeys are not supported in embedded WebView', 'NotSupportedError'));
-          }
-          return origGet.apply(this, arguments);
-        };
-      }
-      var origCreate = navigator.credentials.create;
-      if (origCreate) {
-        navigator.credentials.create = function(opts) {
-          if (opts && opts.publicKey) {
-            return Promise.reject(new DOMException('Passkeys are not supported in embedded WebView', 'NotSupportedError'));
-          }
-          return origCreate.apply(this, arguments);
-        };
-      }
-    }
-  } catch (e) {}
-})();
-""".trimIndent()
-
-/**
- * Blink's `DOMWindow::Close()` blocks `window.close()` when `BackForwardLength() > 1`
- * (which happens after multi-step Google login + 2FA in the popup), preventing
- * `WebChromeClient.onCloseWindow` from firing on `/gsi/transform`.
- * Hook `window.close` at document start so the popup always closes after posting the token.
- */
-private val POPUP_CLOSE_HOOK_JS = """
-(function(){
-  if (window.__robin_close_hooked__) return;
-  window.__robin_close_hooked__ = true;
-  var origClose = window.close;
-  window.close = function() {
-    try {
-      if (origClose) origClose.call(window);
-    } catch (e) {}
-    setTimeout(function() {
-      try {
-        if (window.RobinPopupCloser && window.RobinPopupCloser.close) {
-          window.RobinPopupCloser.close();
-        }
-      } catch (e) {}
-    }, 150);
-  };
-})();
-""".trimIndent()
-
-private fun installWebAuthnSuppression(webView: WebView) {
-    if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
-        try {
-            WebViewCompat.addDocumentStartJavaScript(webView, SUPPRESS_WEBAUTHN_JS, setOf("*"))
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to install document-start WebAuthn suppression", e)
-        }
-    }
-}
-
-/**
- * Compose's AndroidView pointer interop often drops mouse hover after touch
- * (PointerInteropFilter stays NotDispatching). Synthesize ACTION_HOVER_* into
- * the WebView so mouseover / CSS :hover reach the page when a mouse or
- * trackpad is used with the phone/tablet app.
- */
+/** Preserve mouse hover behaviour without widening the browser's trust boundary. */
 private fun dispatchWebViewHover(webView: WebView, action: Int, position: Offset) {
     val now = SystemClock.uptimeMillis()
     val event = MotionEvent.obtain(now, now, action, position.x, position.y, 0)
@@ -810,27 +452,87 @@ private fun FeedBootCover(visible: Boolean) {
     }
 }
 
-/**
- * Clears X cookies / site storage and opens the login flow.
- *
- * The boot cover already hides the live SPA. Do not navigate to about:blank —
- * that races with cookie wipe and can leave Android WebView stuck on a blank
- * document with a partial progress bar.
- */
-private fun signOutOfX(webView: WebView?) {
-    Analytics.track("sign_out")
-    webView?.stopLoading()
-    WebStorage.getInstance().deleteAllData()
-    val cookies = CookieManager.getInstance()
-    cookies.removeAllCookies {
-        cookies.flush()
-        webView?.post {
-            webView.clearCache(true)
-            webView.clearFormData()
-            webView.clearHistory()
-            // /i/flow/login skips filter bootstrap (auth passthrough).
-            webView.loadUrl("https://x.com/i/flow/login")
+/** Discard running pages before clearing the shared WebView session. */
+private fun signOutOfX(webView: WebView?, onFailure: (String) -> Unit) {
+    WebAuthPopup.closeFor(webView)
+    val hardened = webView as? HardenedWebView
+    if (hardened == null) {
+        onFailure("Robin's secure browser is unavailable, so sign-out could not be completed. " +
+            "Clear Robin's storage in Android Settings to remove saved sign-in data before using Robin again.")
+        return
+    }
+    if (hardened.isResettingSession) return
+    hardened.isResettingSession = true
+    val handler = Handler(Looper.getMainLooper())
+    var finished = false
+    fun failClosed() {
+        if (finished) return
+        finished = true
+        hardened.isResettingSession = true
+        hardened.onSessionBlankCommitted = null
+        runCatching { WebViewHardening.recordSessionReset(hardened.context, pending = true) }
+        runCatching { WebViewHardening.setServiceWorkerNetworkBlocked(true) }
+        runCatching { CookieManager.getInstance().setAcceptCookie(false) }
+        runCatching {
+            hardened.settings.javaScriptEnabled = false
+            hardened.settings.blockNetworkLoads = true
+            hardened.stopLoading()
         }
+        onFailure("Robin could not finish clearing your sign-in data and has blocked browsing. " +
+            "Reopen Robin to retry. If this continues, clear Robin's storage in Android Settings before signing in again.")
+    }
+    val timeout = Runnable { failClosed() }
+    try {
+        hardened.settings.javaScriptEnabled = false
+        hardened.settings.blockNetworkLoads = true
+        hardened.stopLoading()
+        CookieManager.getInstance().setAcceptCookie(false)
+        check(WebViewHardening.recordSessionReset(hardened.context, pending = true))
+        check(WebViewHardening.setServiceWorkerNetworkBlocked(true))
+        check(WebViewFeature.isFeatureSupported(WebViewFeature.DELETE_BROWSING_DATA))
+        hardened.onSessionBlankCommitted = {
+            if (!finished) {
+                try {
+                    // Unlike legacy WebStorage.deleteAllData, this clears all
+                    // website data, including service workers and network cache.
+                    // It is not atomic: keep pages and workers offline until done.
+                    WebStorageCompat.deleteBrowsingData(WebStorage.getInstance()) {
+                        if (!finished) {
+                            try {
+                                CookieManager.getInstance().flush()
+                                if (hardened.isAttachedToWindow) {
+                                    hardened.clearFormData()
+                                    hardened.clearHistory()
+                                    hardened.clearSslPreferences()
+                                }
+                                check(WebViewHardening.recordSessionReset(hardened.context, pending = false))
+                                check(WebViewHardening.setServiceWorkerNetworkBlocked(false))
+                                CookieManager.getInstance().setAcceptCookie(true)
+                                hardened.isResettingSession = false
+                                if (hardened.isAttachedToWindow) {
+                                    hardened.settings.blockNetworkLoads = false
+                                    hardened.settings.javaScriptEnabled = true
+                                    hardened.loadUrl("https://x.com/i/flow/login")
+                                }
+                                finished = true
+                                handler.removeCallbacks(timeout)
+                            } catch (_: Exception) {
+                                // Leave the persisted pending flag set on any
+                                // failure so a process restart retries the wipe.
+                                failClosed()
+                            }
+                        }
+                    }
+                } catch (_: Exception) {
+                    failClosed()
+                }
+            }
+        }
+        handler.postDelayed(timeout, 30_000)
+        // A committed blank document discards old timers before deleting data.
+        hardened.loadUrl("about:blank")
+    } catch (_: Exception) {
+        failClosed()
     }
 }
 
@@ -885,6 +587,10 @@ fun XWebFeedScreen(
     /** One automatic /home reload per refresh when X paints the welcome empty state. */
     var welcomeAutoRetryUsed by remember { mutableStateOf(false) }
     var activeFactCheck by remember { mutableStateOf<FactCheckRequest?>(null) }
+    var securityNotice by remember { mutableStateOf<String?>(null) }
+    var webViewUnavailable by remember { mutableStateOf(false) }
+    var mainDocumentTrusted by remember { mutableStateOf(false) }
+    val bridgeRateLimiter = remember { WebBridgeRateLimiter() }
     /** Bumped to restart the boot-cover timeout without toggling visibility. */
     var coverDeadline by remember { mutableIntStateOf(0) }
     val welcomeRetryHolder = remember { mutableStateOf<(() -> Unit)?>(null) }
@@ -893,10 +599,12 @@ fun XWebFeedScreen(
 
     fun scrollWebToTop() {
         val wv = webViewRef ?: return
+        if (!WebUrlPolicy.isFeedUrl(wv.url)) return
         wv.scrollTo(0, 0)
         wv.evaluateJavascript(
             """
             (function(){
+              $FEED_SCRIPT_GUARD
               var roots = [];
               function add(el) { if (el) roots.push(el); }
               add(document.scrollingElement);
@@ -1212,11 +920,11 @@ fun XWebFeedScreen(
 
     DisposableEffect(webViewRef) {
         val wv = webViewRef
-        if (wv != null) {
+        if (wv != null && BuildConfig.DEBUG) {
             AppGraph.benchmark.registerRunner { onComplete ->
                 activeBenchmarkCallback.value = onComplete
                 wv.evaluateJavascript(
-                    "if (typeof window.__ROBIN_RUN_BENCHMARK__ === 'function') window.__ROBIN_RUN_BENCHMARK__();",
+                    "(function() { $FEED_SCRIPT_GUARD if (typeof window.__ROBIN_RUN_BENCHMARK__ === 'function') window.__ROBIN_RUN_BENCHMARK__(); })();",
                     null,
                 )
             }
@@ -1296,11 +1004,21 @@ fun XWebFeedScreen(
                                 .clip(RoundedCornerShape(5.dp)),
                         )
                         Spacer(Modifier.width(6.dp))
-                        Text(
-                            text = stringResource(R.string.x_web_feed_title),
-                            color = headerAccent,
-                            style = MaterialTheme.typography.titleMedium,
-                        )
+                        Column {
+                            Text(
+                                text = stringResource(R.string.x_web_feed_title),
+                                color = headerAccent,
+                                style = MaterialTheme.typography.titleMedium,
+                            )
+                            WebUrlPolicy.origin(pageUrl)?.let { origin ->
+                                Text(
+                                    text = origin,
+                                    color = headerAccent,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    maxLines = 1,
+                                )
+                            }
+                        }
                     }
                 }
                 Row(
@@ -1323,7 +1041,8 @@ fun XWebFeedScreen(
                         onClick = {
                             Analytics.track("compose_opened")
                             noteUserInteraction()
-                            webViewRef?.evaluateJavascript(OPEN_COMPOSE_JS, null)
+                            webViewRef?.takeIf { WebUrlPolicy.isFeedUrl(it.url) }
+                                ?.evaluateJavascript(OPEN_COMPOSE_JS, null)
                         },
                         modifier = Modifier.size(40.dp),
                     ) {
@@ -1366,13 +1085,14 @@ fun XWebFeedScreen(
                 .weight(1f)
                 .clipToBounds(),
         ) {
+            if (!webViewUnavailable) {
             AndroidView(
                 modifier = Modifier
                     .fillMaxSize()
                     .clipToBounds()
                     .webViewMouseHover(webViewRef),
                 factory = { ctx ->
-                WebView(ctx).apply {
+                HardenedWebView(ctx).apply {
                     // Prevent black surface flash during cold start before first visual paint.
                     alpha = if (showBootCover) 0f else 1f
                     setBackgroundColor(android.graphics.Color.TRANSPARENT)
@@ -1380,28 +1100,93 @@ fun XWebFeedScreen(
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.MATCH_PARENT,
                     )
-                    if (org.evergreenlabs.robin.BuildConfig.DEBUG) {
-                        WebView.setWebContentsDebuggingEnabled(true)
-                    }
-                    settings.javaScriptEnabled = true
-                    settings.domStorageEnabled = true
+                    WebViewHardening.configure(this, supportsPopups = true)
                     settings.cacheMode = WebSettings.LOAD_DEFAULT
-                    settings.mediaPlaybackRequiresUserGesture = false
-                    // Google/Apple SSO uses window.open — must allow and handle it.
-                    settings.setSupportMultipleWindows(true)
-                    settings.javaScriptCanOpenWindowsAutomatically = true
-                    // Mobile Chrome UA so X serves TopNavBar layout (same CSS path as iOS).
                     settings.userAgentString = MOBILE_CHROME_USER_AGENT
                     settings.useWideViewPort = true
                     settings.loadWithOverviewMode = true
                     settings.textZoom = 100
-                    installWebAuthnSuppression(this)
+                    setDownloadListener { _, _, _, _, _ ->
+                        securityNotice = "Downloads are disabled in Robin. Open the link in your browser if you need the file."
+                    }
 
-                    CookieManager.getInstance().setAcceptCookie(true)
-                    CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
-
-                    addJavascriptInterface(ScrollBridge { onWebScroll(it) }, "RobinScroll")
-                    addJavascriptInterface(InteractBridge { noteUserInteraction() }, "RobinInteract")
+                    val secureMessagingSupported =
+                        WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER) &&
+                            WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT) &&
+                            WebViewFeature.isFeatureSupported(WebViewFeature.DELETE_BROWSING_DATA) &&
+                            WebViewHardening.configureServiceWorkers(WebViewHardening.isSessionResetPending(ctx))
+                    if (!secureMessagingSupported) {
+                        webViewUnavailable = true
+                        securityNotice = "Update Android System WebView or Chrome, then reopen Robin. This version cannot provide Robin's secure connection to the feed."
+                        return@apply
+                    }
+                    val bridgeInstalled = runCatching {
+                        WebViewCompat.addWebMessageListener(
+                            this,
+                            WebBridgeScript.TRANSPORT_NAME,
+                            WebUrlPolicy.feedOrigins,
+                        ) { _, message, sourceOrigin, isMainFrame, _ ->
+                            if (isResettingSession || !WebUrlPolicy.isFeedUrl(this.url) ||
+                                !WebUrlPolicy.isBridgeOrigin(sourceOrigin.toString(), isMainFrame)
+                            ) {
+                                return@addWebMessageListener
+                            }
+                            val messageTime = SystemClock.elapsedRealtime()
+                            if (!bridgeRateLimiter.acceptEnvelope(messageTime)) return@addWebMessageListener
+                            val raw = runCatching { message.data }.getOrNull() ?: return@addWebMessageListener
+                            val parsed = WebNativeMessagePolicy.parse(raw, BuildConfig.ENABLE_AI, BuildConfig.DEBUG)
+                                ?: return@addWebMessageListener
+                            if (!bridgeRateLimiter.accept(parsed.kind, messageTime)) {
+                                return@addWebMessageListener
+                            }
+                            when (parsed) {
+                                is WebNativeMessage.Scroll -> onWebScroll(parsed.y)
+                                WebNativeMessage.Interact -> noteUserInteraction()
+                                is WebNativeMessage.BootReady -> {
+                                    if (bootNonceGate.onBoot(parsed.nonce)) revealBootHolder.value?.invoke()
+                                }
+                                is WebNativeMessage.BootRetry -> {
+                                    if (bootNonceGate.onRetry(parsed.nonce)) welcomeRetryHolder.value?.invoke()
+                                }
+                                is WebNativeMessage.FactCheck -> {
+                                    // The sheet has its own native confirmation before sending
+                                    // any data. Repeated page requests cannot replace an open sheet.
+                                    if (BuildConfig.ENABLE_AI && activeFactCheck == null) {
+                                        val input = parsed.input
+                                        activeFactCheck = FactCheckRequest(
+                                            text = input.text,
+                                            author = input.author,
+                                            tweetURL = input.tweetURL,
+                                            externalLinks = input.externalLinks,
+                                        )
+                                    }
+                                }
+                                is WebNativeMessage.Benchmark -> {
+                                    if (BuildConfig.DEBUG) {
+                                        val result = org.evergreenlabs.robin.services.BenchmarkResult(
+                                            initialLoadMs = parsed.initialLoadMs,
+                                            scrollRenderCompletionMs = parsed.scrollRenderCompletionMs,
+                                            timestamp = parsed.timestamp,
+                                            bootReady = parsed.bootReady,
+                                        )
+                                        AppGraph.benchmark.recordRun(result)
+                                        activeBenchmarkCallback.value?.invoke(result)
+                                        activeBenchmarkCallback.value = null
+                                    }
+                                }
+                            }
+                        }
+                        WebViewCompat.addDocumentStartJavaScript(
+                            this,
+                            WebBridgeScript.source(BuildConfig.ENABLE_AI, BuildConfig.DEBUG),
+                            WebUrlPolicy.feedOrigins,
+                        )
+                    }.isSuccess
+                    if (!bridgeInstalled) {
+                        webViewUnavailable = true
+                        securityNotice = "Robin could not establish a secure connection to the feed. Update Android System WebView or Chrome and reopen Robin."
+                        return@apply
+                    }
                     setOnTouchListener { _, event ->
                         if (event.actionMasked == MotionEvent.ACTION_DOWN) noteUserInteraction()
                         false
@@ -1409,370 +1194,42 @@ fun XWebFeedScreen(
                     setOnHoverListener { _, event ->
                         if (event.actionMasked == MotionEvent.ACTION_HOVER_MOVE ||
                             event.actionMasked == MotionEvent.ACTION_HOVER_ENTER
-                        ) {
-                            noteUserInteraction()
-                        }
+                        ) noteUserInteraction()
                         false
                     }
-                    addJavascriptInterface(
-                        BootBridge(
-                            onReady = { nonce ->
-                                if (bootNonceGate.onBoot(nonce)) revealBootHolder.value?.invoke()
-                            },
-                            onRetry = { nonce ->
-                                if (bootNonceGate.onRetry(nonce)) welcomeRetryHolder.value?.invoke()
-                            },
-                        ),
-                        "RobinBoot",
-                    )
-                    addJavascriptInterface(
-                        FactCheckBridge { request ->
-                            runCatching {
-                                val v = context.getSystemService(Vibrator::class.java)
-                                v?.vibrate(VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE))
-                            }.onFailure { e ->
-                                Log.w(TAG, "Haptic vibration failed", e)
-                            }
-                            activeFactCheck = request
-                        },
-                        "RobinFactCheck",
-                    )
-                    addJavascriptInterface(
-                        BenchmarkBridge { raw ->
-                            val result = org.evergreenlabs.robin.services.BenchmarkResult.fromJsonString(raw)
-                            if (result != null) {
-                                AppGraph.benchmark.recordRun(result)
-                                android.util.Log.i(
-                                    "RobinBenchmark",
-                                    "In-App Benchmark Complete: initialLoad=${result.initialLoadMs}ms, " +
-                                        "scrollRenderCompletion=${result.scrollRenderCompletionMs}ms, bootReady=${result.bootReady}",
-                                )
-                            }
-                            val cb = activeBenchmarkCallback.value
-                            activeBenchmarkCallback.value = null
-                            cb?.invoke(result)
-                        },
-                        "RobinBenchmark",
-                    )
-                    addJavascriptInterface(
-                        SentryBridge(),
-                        "RobinSentry",
-                    )
 
                     webChromeClient = object : WebChromeClient() {
                         override fun onProgressChanged(view: WebView?, newProgress: Int) {
                             progress = newProgress / 100f
                         }
 
+                        override fun onPermissionRequest(request: PermissionRequest?) {
+                            request?.deny()
+                        }
+
+                        override fun onGeolocationPermissionsShowPrompt(
+                            origin: String?,
+                            callback: android.webkit.GeolocationPermissions.Callback?,
+                        ) {
+                            callback?.invoke(origin.orEmpty(), false, false)
+                        }
+
                         override fun onCreateWindow(
                             view: WebView?,
                             isDialog: Boolean,
                             isUserGesture: Boolean,
-                            resultMsg: Message?,
-                        ): Boolean {
-                            // Real popup WebView so Google/Apple keep window.opener (no external browser).
-                            val host = view ?: return false
-                            val context = host.context
-
-                            // Ignore "open in X app" / Chrome bounce window.open nags (parity with iOS).
-                            val hitUrl = host.hitTestResult.extra
-                            if (!hitUrl.isNullOrBlank()) {
-                                rewrittenInAppUrl(hitUrl)?.let { rewritten ->
-                                    if (!isAllowedWebViewUrl(rewritten)) {
-                                        Log.i(TAG, "popup nag → browser: $rewritten")
-                                        openInDefaultBrowser(context, rewritten)
-                                    } else {
-                                        Log.i(TAG, "popup nag rewrite → $rewritten")
-                                        host.loadUrl(rewritten)
-                                    }
-                                    return false
+                            resultMsg: android.os.Message?,
+                        ): Boolean = WebAuthPopup.open(
+                            host = view,
+                            isUserGesture = isUserGesture,
+                            resultMessage = resultMsg,
+                            onBlocked = { securityNotice = it },
+                            openExternal = { target ->
+                                if (!openInDefaultBrowser(view?.context, target)) {
+                                    securityNotice = "Robin could not open this link in your browser."
                                 }
-                                val scheme = android.net.Uri.parse(hitUrl).scheme?.lowercase(Locale.US).orEmpty()
-                                if (scheme.isNotEmpty() &&
-                                    scheme != "http" && scheme != "https" &&
-                                    scheme != "about" && scheme != "blob"
-                                ) {
-                                    Log.i(TAG, "ignored popup scheme: $hitUrl")
-                                    return false
-                                }
-                                // window.open from link taps: X uses https://t.co/…
-                                // Only Google/Apple OAuth needs a real child WebView.
-                                if (scheme == "http" || scheme == "https") {
-                                    when {
-                                        isOAuthPopupUrl(hitUrl) -> { /* fall through */ }
-                                        isXHost(hitUrl) -> {
-                                            Log.i(TAG, "popup → main webview: $hitUrl")
-                                            host.loadUrl(hitUrl)
-                                            return false
-                                        }
-                                        else -> {
-                                            Log.i(TAG, "popup → external browser: $hitUrl")
-                                            openInDefaultBrowser(context, hitUrl)
-                                            return false
-                                        }
-                                    }
-                                }
-                            }
-
-                            val density = context.resources.displayMetrics.density
-                            fun dp(v: Int) = (v * density).toInt()
-
-                            val popup = WebView(context).apply {
-                                settings.javaScriptEnabled = true
-                                settings.domStorageEnabled = true
-                                settings.javaScriptCanOpenWindowsAutomatically = true
-                                settings.setSupportMultipleWindows(false)
-                                // Stock UA — Google often rejects embedded/spoofed mobile UAs.
-                                settings.userAgentString = WebSettings.getDefaultUserAgent(context)
-                                CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
-                                installWebAuthnSuppression(this)
-                                if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
-                                    try {
-                                        WebViewCompat.addDocumentStartJavaScript(this, POPUP_CLOSE_HOOK_JS, setOf("*"))
-                                    } catch (e: Exception) {
-                                        Log.w(TAG, "Failed to install document-start popup close hook", e)
-                                    }
-                                }
-                            }
-                            val dialog = Dialog(context, android.R.style.Theme_DeviceDefault_Light_NoActionBar)
-                            val root = LinearLayout(context).apply {
-                                orientation = LinearLayout.VERTICAL
-                                setBackgroundColor(Color.WHITE)
-                                layoutParams = ViewGroup.LayoutParams(
-                                    ViewGroup.LayoutParams.MATCH_PARENT,
-                                    ViewGroup.LayoutParams.MATCH_PARENT,
-                                )
-                            }
-                            // Compact Close on the right (matches iOS AuthPopupViewController).
-                            val toolbar = FrameLayout(context).apply {
-                                setPadding(dp(12), dp(10), dp(12), dp(6))
-                            }
-                            val close = TextView(context).apply {
-                                text = "Close"
-                                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-                                setTypeface(typeface, Typeface.BOLD)
-                                setTextColor(Color.WHITE)
-                                background = android.graphics.drawable.GradientDrawable().apply {
-                                    setColor(0xFF2196F3.toInt())
-                                    cornerRadius = 999f * density
-                                }
-                                setPadding(dp(12), dp(5), dp(12), dp(5))
-                                gravity = Gravity.CENTER
-                            }
-                            toolbar.addView(
-                                close,
-                                FrameLayout.LayoutParams(
-                                    FrameLayout.LayoutParams.WRAP_CONTENT,
-                                    dp(28),
-                                    Gravity.END or Gravity.CENTER_VERTICAL,
-                                ),
-                            )
-                            root.addView(
-                                toolbar,
-                                LinearLayout.LayoutParams(
-                                    LinearLayout.LayoutParams.MATCH_PARENT,
-                                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                                ),
-                            )
-                            root.addView(
-                                popup,
-                                LinearLayout.LayoutParams(
-                                    LinearLayout.LayoutParams.MATCH_PARENT,
-                                    0,
-                                    1f,
-                                ),
-                            )
-                            var ssoFinished = false
-                            var sawOAuthProvider = false
-                            var popupDestroyed = false
-                            fun destroyPopupQuietly() {
-                                if (popupDestroyed) return
-                                popupDestroyed = true
-                                // Keep the child WebView alive briefly after dialog dismiss so
-                                // in-flight postMessage / BroadcastChannel to opener completes.
-                                host.postDelayed({
-                                    try {
-                                        popup.stopLoading()
-                                        popup.destroy()
-                                    } catch (_: Exception) {
-                                    }
-                                }, 400)
-                            }
-                            fun hasXSessionCookie(): Boolean {
-                                val raw = CookieManager.getInstance().getCookie("https://x.com").orEmpty()
-                                return raw.contains("auth_token=") || raw.contains("twid=")
-                            }
-                            /** After GIS window.close, wait for opener JS to set the X session or complete 2FA. */
-                            fun pollForSessionThenGoHome() {
-                                var attempts = 0
-                                val poll = object : Runnable {
-                                    override fun run() {
-                                        CookieManager.getInstance().flush()
-                                        if (hasXSessionCookie()) {
-                                            Log.i(TAG, "session cookie ready — loading home")
-                                            host.loadUrl(X_HOME)
-                                            return
-                                        }
-                                        // Opener may have already navigated to the feed.
-                                        if (isFeedHome(host.url)) {
-                                            Log.i(TAG, "host already on feed after GIS")
-                                            return
-                                        }
-                                        attempts++
-                                        if (attempts < 120) {
-                                            host.postDelayed(this, 500)
-                                        } else {
-                                            Log.w(
-                                                TAG,
-                                                "no X session after GIS; host=${host.url}",
-                                            )
-                                        }
-                                    }
-                                }
-                                host.postDelayed(poll, 500)
-                            }
-                            /**
-                             * Google Identity Services (`gis_transform`) posts the id_token to
-                             * `window.opener` then `window.close()`. Navigating/reloading the
-                             * host WebView here aborts that handshake.
-                             *
-                             * The popup Dialog must be shown *before* WebViewTransport delivery so
-                             * the child is window-attached and `window.opener` is non-null (same
-                             * lesson as the original in-app child WebView / iOS AuthPopup fix).
-                             */
-                            fun finishSso(reason: String) {
-                                if (ssoFinished) return
-                                ssoFinished = true
-                                CookieManager.getInstance().flush()
-                                val hasSession = hasXSessionCookie()
-                                Log.i(
-                                    TAG,
-                                    "SSO finish ($reason) hasSession=$hasSession host=${host.url} " +
-                                        "cookies=${CookieManager.getInstance().getCookie("https://x.com")?.take(100)}",
-                                )
-                                if (dialog.isShowing) {
-                                    dialog.dismiss()
-                                } else {
-                                    destroyPopupQuietly()
-                                }
-                                when {
-                                    hasSession -> host.post { host.loadUrl(X_HOME) }
-                                    reason == "popup-x-host" -> host.post { host.loadUrl(X_HOME) }
-                                    else -> pollForSessionThenGoHome()
-                                }
-                            }
-                            fun dismissAuthUi() {
-                                if (ssoFinished) return
-                                if (dialog.isShowing) {
-                                    dialog.dismiss()
-                                } else {
-                                    destroyPopupQuietly()
-                                }
-                            }
-                            fun onPopupUrl(url: String?, finished: Boolean) {
-                                if (url.isNullOrBlank() || ssoFinished) return
-                                Log.i(TAG, "popup ${if (finished) "finish" else "start"} $url")
-                                if (isOAuthPopupUrl(url)) {
-                                    sawOAuthProvider = true
-                                }
-                                if (finished && sawOAuthProvider) {
-                                    if (isXHost(url)) {
-                                        finishSso("popup-x-host")
-                                    } else {
-                                        val path = try {
-                                            android.net.Uri.parse(url).path.orEmpty().lowercase(Locale.US)
-                                        } catch (_: Exception) {
-                                            ""
-                                        }
-                                        if (path == "/gsi/transform" || path == "/gis/transform" || path.endsWith("/transform")) {
-                                            // GIS transform posts the token to opener and calls window.close.
-                                            // Auto-dismiss as a safety net if window.close was blocked or delayed.
-                                            host.postDelayed({
-                                                if (!ssoFinished) {
-                                                    Log.i(TAG, "GIS transform fallback auto-closing auth popup")
-                                                    finishSso("gis-transform-fallback")
-                                                }
-                                            }, 1200)
-                                        }
-                                    }
-                                }
-                            }
-                            popup.addJavascriptInterface(
-                                object {
-                                    @JavascriptInterface
-                                    fun close() {
-                                        host.post {
-                                            Log.i(TAG, "popup JS bridge close invoked sawOAuth=$sawOAuthProvider")
-                                            if (sawOAuthProvider) {
-                                                finishSso("js-bridge.close")
-                                            } else {
-                                                dismissAuthUi()
-                                            }
-                                        }
-                                    }
-                                },
-                                "RobinPopupCloser",
-                            )
-                            fun injectPopupHooksFallback(v: WebView?) {
-                                v?.evaluateJavascript(SUPPRESS_WEBAUTHN_JS, null)
-                                v?.evaluateJavascript(POPUP_CLOSE_HOOK_JS, null)
-                            }
-                            popup.webChromeClient = object : WebChromeClient() {
-                                override fun onCloseWindow(window: WebView?) {
-                                    Log.i(TAG, "popup onCloseWindow sawOAuth=$sawOAuthProvider")
-                                    if (sawOAuthProvider) {
-                                        finishSso("window.close")
-                                    } else {
-                                        dismissAuthUi()
-                                    }
-                                }
-                            }
-                            popup.webViewClient = object : WebViewClient() {
-                                override fun shouldOverrideUrlLoading(
-                                    v: WebView?,
-                                    request: WebResourceRequest?,
-                                ): Boolean = handleWebNavigation(
-                                    v,
-                                    request?.url?.toString(),
-                                    request?.isForMainFrame ?: true,
-                                    isAuthPopup = true,
-                                )
-
-                                override fun onPageStarted(v: WebView?, url: String?, favicon: Bitmap?) {
-                                    injectPopupHooksFallback(v)
-                                    onPopupUrl(url, finished = false)
-                                }
-
-                                override fun onPageFinished(v: WebView?, url: String?) {
-                                    injectPopupHooksFallback(v)
-                                    onPopupUrl(url, finished = true)
-                                }
-                            }
-                            close.setOnClickListener {
-                                if (sawOAuthProvider) {
-                                    finishSso("close-button")
-                                } else {
-                                    dismissAuthUi()
-                                }
-                            }
-                            dialog.setContentView(root)
-                            dialog.setOnDismissListener {
-                                destroyPopupQuietly()
-                            }
-                            dialog.window?.setLayout(
-                                ViewGroup.LayoutParams.MATCH_PARENT,
-                                ViewGroup.LayoutParams.MATCH_PARENT,
-                            )
-                            dialog.window?.setBackgroundDrawable(Color.WHITE.toDrawable())
-                            // Show before transport so the child WebView is attached — required
-                            // for window.opener (GIS posts the id_token to the opener).
-                            dialog.show()
-
-                            val transport = resultMsg?.obj as? WebView.WebViewTransport ?: return false
-                            transport.webView = popup
-                            resultMsg.sendToTarget()
-                            return true
-                        }
+                            },
+                        )
                     }
                     webViewClient = object : WebViewClient() {
                         override fun shouldOverrideUrlLoading(
@@ -1782,11 +1239,60 @@ fun XWebFeedScreen(
                             view,
                             request?.url?.toString(),
                             request?.isForMainFrame ?: true,
+                            request?.hasGesture() == true,
+                            onBlocked = { securityNotice = it },
                         )
+
+                        override fun shouldInterceptRequest(
+                            view: WebView?,
+                            request: WebResourceRequest?,
+                        ): WebResourceResponse? {
+                            if (request == null) return WebViewHardening.blockedResponse()
+                            if (view is HardenedWebView && view.isResettingSession) {
+                                return if (request.url.toString() == "about:blank") null else WebViewHardening.blockedResponse()
+                            }
+                            val isHttps = request.url.scheme.equals("https", ignoreCase = true)
+                            if (!isHttps || (request.isForMainFrame && !WebUrlPolicy.isTrustedMainFrameUrl(request.url.toString()))) {
+                                if (request.isForMainFrame) view?.post {
+                                    securityNotice = "Robin blocked a page outside its supported secure sites."
+                                }
+                                return WebViewHardening.blockedResponse()
+                            }
+                            return null
+                        }
+
+                        override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
+                            handler?.cancel()
+                            securityNotice = "Robin stopped loading because this site's secure connection could not be verified."
+                        }
+
+                        override fun onSafeBrowsingHit(
+                            view: WebView?,
+                            request: WebResourceRequest?,
+                            threatType: Int,
+                            callback: SafeBrowsingResponse?,
+                        ) {
+                            callback?.backToSafety(false)
+                            securityNotice = "Robin blocked a page flagged as unsafe."
+                        }
+
+                        override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
+                            webViewRef = null
+                            webViewUnavailable = true
+                            securityNotice = "Robin's browser stopped. Reopen Robin to continue."
+                            return true
+                        }
 
                         override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                             pageUrl = url
-                            view?.evaluateJavascript(SUPPRESS_WEBAUTHN_JS, null)
+                            mainDocumentTrusted = false
+                            view?.visibility = View.INVISIBLE
+                            if (view is HardenedWebView && view.isResettingSession && url == "about:blank") return
+                            if (!WebUrlPolicy.isTrustedMainFrameUrl(url)) {
+                                view?.stopLoading()
+                                securityNotice = "Robin blocked a page outside its supported secure sites."
+                                return
+                            }
                             if (isFeedHome(url)) {
                                 if (suppressNextHomeBootCoverState.value) {
                                     // Warm reload: keep suppress until RobinBoot.ready().
@@ -1797,7 +1303,7 @@ fun XWebFeedScreen(
                                     warmSnapshot = null
                                 }
                             }
-                            if (isXHost(url)) {
+                            if (WebUrlPolicy.isFeedUrl(url)) {
                                 view?.let { XFilterInjector.evaluateIfNeeded(it) }
                             }
                         }
@@ -1812,23 +1318,35 @@ fun XWebFeedScreen(
 
                         override fun onPageCommitVisible(view: WebView?, url: String?) {
                             super.onPageCommitVisible(view, url)
-                            if (!showBootCover) {
-                                view?.alpha = 1f
-                            }
+                            if ((view as? HardenedWebView)?.completeSessionResetIfBlank(url) == true) return
+                            mainDocumentTrusted = WebUrlPolicy.isTrustedMainFrameUrl(url) &&
+                                WebUrlPolicy.isTrustedMainFrameUrl(view?.url) &&
+                                WebUrlPolicy.origin(url) == WebUrlPolicy.origin(view?.url)
+                            if (mainDocumentTrusted) pageUrl = view?.url
+                            view?.visibility = if (mainDocumentTrusted) View.VISIBLE else View.INVISIBLE
+                            if (mainDocumentTrusted && !showBootCover) view?.alpha = 1f
                         }
 
                         override fun onPageFinished(view: WebView?, url: String?) {
-                            pageUrl = url
+                            if ((view as? HardenedWebView)?.completeSessionResetIfBlank(url) == true) return
+                            pageUrl = view?.url
+                            if (!WebUrlPolicy.isTrustedMainFrameUrl(url) ||
+                                !WebUrlPolicy.isTrustedMainFrameUrl(view?.url) ||
+                                WebUrlPolicy.origin(url) != WebUrlPolicy.origin(view?.url)
+                            ) {
+                                view?.visibility = View.INVISIBLE
+                                return
+                            }
                             view?.let {
-                                val nonceGen = bootNonceGate.noteNavigationFinished()
-                                it.evaluateJavascript("window.__ROBIN_BOOT_NONCE__||''") { raw ->
-                                    val nonce = raw?.trim()?.removeSurrounding("\"") ?: ""
-                                    if (bootNonceGate.onDocumentNonce(nonceGen, nonce)) {
-                                        revealBootHolder.value?.invoke()
+                                if (WebUrlPolicy.isFeedUrl(url)) {
+                                    val nonceGen = bootNonceGate.noteNavigationFinished()
+                                    it.evaluateJavascript("(function() { $FEED_SCRIPT_GUARD var n=window.__ROBIN_BOOT_NONCE__; return typeof n==='string' && n.length<=128 ? n : ''; })();") { raw ->
+                                        val nonce = raw?.trim()?.removeSurrounding("\"") ?: ""
+                                        if (bootNonceGate.onDocumentNonce(nonceGen, nonce)) {
+                                            revealBootHolder.value?.invoke()
+                                        }
                                     }
-                                }
-                                it.evaluateJavascript(SCROLL_PROBE_JS, null)
-                                if (isXHost(url)) {
+                                    it.evaluateJavascript(SCROLL_PROBE_JS, null)
                                     XFilterInjector.evaluateIfNeeded(it)
                                     XFilterInjector.applySettingsOnly(
                                         it,
@@ -1854,7 +1372,7 @@ fun XWebFeedScreen(
                             isReload: Boolean,
                         ) {
                             super.doUpdateVisitedHistory(view, url, isReload)
-                            pageUrl = url ?: view?.url
+                            pageUrl = view?.url
                             canGoBack = view?.canGoBack() == true
                         }
                     }
@@ -1865,8 +1383,16 @@ fun XWebFeedScreen(
                         FilterSettings.Default,
                         AppGraph.fontScale.scale.value,
                     )
-                    loadUrl(X_HOME)
                     webViewRef = this
+                    if (WebViewHardening.isSessionResetPending(ctx)) {
+                        signOutOfX(this) { message ->
+                            securityNotice = message
+                            showBootCover = false
+                            webViewUnavailable = true
+                        }
+                    } else {
+                        loadUrl(X_HOME)
+                    }
                 }
             },
                 update = { view ->
@@ -1874,15 +1400,27 @@ fun XWebFeedScreen(
                     canGoBack = view.canGoBack()
                     pageUrl = view.url
                     view.alpha = if (showBootCover) 0f else 1f
+                    view.visibility = if (mainDocumentTrusted) View.VISIBLE else View.INVISIBLE
                     // Settings / font scale are applied via LaunchedEffect — avoid
                     // re-toggling zoom/classes on every recomposition (paint churn).
                 },
                 onRelease = { view ->
-                    view.stopLoading()
-                    view.destroy()
+                    WebAuthPopup.closeFor(view)
+                    runCatching {
+                        view.stopLoading()
+                        view.destroy()
+                    }
                     if (webViewRef === view) webViewRef = null
                 },
             )
+
+            } else {
+                Text(
+                    text = "Update Android System WebView or Chrome if needed, then reopen Robin to continue.",
+                    modifier = Modifier.align(Alignment.Center).padding(24.dp),
+                    style = MaterialTheme.typography.bodyLarge,
+                )
+            }
 
             warmSnapshot?.let { snapshot ->
                 Image(
@@ -1912,9 +1450,26 @@ fun XWebFeedScreen(
         InfoSheet(
             onDismiss = { chrome.setInfoPresented(false) },
             onSignOut = {
+                activeFactCheck = null
+                mainDocumentTrusted = false
                 clearWarmSnapshot()
                 showBootCoverState.value = true
-                signOutOfX(webViewRef)
+                signOutOfX(webViewRef) { message ->
+                    securityNotice = message
+                    showBootCover = false
+                    webViewUnavailable = true
+                }
+            },
+        )
+    }
+
+    securityNotice?.let { message ->
+        AlertDialog(
+            onDismissRequest = { securityNotice = null },
+            title = { Text("Robin security") },
+            text = { Text(message) },
+            confirmButton = {
+                TextButton(onClick = { securityNotice = null }) { Text("OK") }
             },
         )
     }

@@ -1,5 +1,7 @@
 # Architecture
 
+> **Android security changes in this fork:** [android-security.md](android-security.md) describes the current origin-scoped bridge, strict navigation, default-off AI and removed telemetry. The upstream platform overview below also describes iOS and historical behaviour; use the Android security guide for Android trust and build decisions.
+
 Robin is a native **Android** and **iOS** client that loads **x.com** in a WebView and injects shared filters so the timeline stays ad-light and defaults to Following (For You is optional in Settings). Robin uses a dedicated Firebase project (`robin-evergreen`) strictly for Firebase AI Logic (Gemini 3.8 Flash fact-checking protected by App Check). There is no Robin custom backend server or Firestore sync — X sign-in is the WebView cookie session.
 
 ## Goals
