@@ -1,7 +1,6 @@
 package org.evergreenlabs.robin.xfilter
 
 import android.content.Context
-import android.util.Log
 import android.webkit.WebView
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
@@ -9,12 +8,12 @@ import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.nio.charset.StandardCharsets
 import org.evergreenlabs.robin.R
+import org.evergreenlabs.robin.security.WebUrlPolicy
 
 /**
  * Loads assets/x-filter and injects settings + CSS + JS into a WebView.
  */
 object XFilterInjector {
-    private const val TAG = "XFilterInjector"
     private const val CSS_ASSET = "x-filter/filter-core.css"
     private const val JS_ASSET = "x-filter/filter-core.js"
 
@@ -27,14 +26,13 @@ object XFilterInjector {
         val js = readAsset(context, JS_ASSET)
         val cssJson = jsonStringLiteral(css)
         val settingsJson = settings.toJsonObjectLiteral(fontScale)
+        val trustedOrigins = trustedOriginArray()
         return """
             (function(){
+              // Keep the trust boundary outside the recoverable setup block.
+              // A failed origin/frame check must never fall through to core JS.
+              if (window.top !== window || $trustedOrigins.indexOf(location.origin) === -1) return;
               try {
-                var h = (location.hostname || '').toLowerCase();
-                var onX = h === 'x.com' || h.endsWith('.x.com')
-                  || h === 'twitter.com' || h.endsWith('.twitter.com');
-                if (!onX) return;
-
                 // Login / SSO flows break under boot gate + chrome hides — leave them alone.
                 var path = (location.pathname || '').toLowerCase();
                 var href = (location.href || '').toLowerCase();
@@ -110,21 +108,13 @@ object XFilterInjector {
                 WebViewCompat.addDocumentStartJavaScript(
                     webView,
                     script,
-                    setOf(
-                        "https://x.com",
-                        "https://*.x.com",
-                        "https://twitter.com",
-                        "https://*.twitter.com",
-                    ),
+                    WebUrlPolicy.feedOrigins,
                 )
-                Log.i(TAG, "Installed document-start x-filter script")
                 webView.setTag(R.id.robin_x_filter_script, null)
                 return
-            } catch (e: Exception) {
-                Log.w(TAG, "DOCUMENT_START_SCRIPT failed; will evaluate on load", e)
+            } catch (_: Exception) {
+                // The fallback has the same exact origin and top-frame guard.
             }
-        } else {
-            Log.i(TAG, "DOCUMENT_START_SCRIPT unsupported; will evaluate on load")
         }
         webView.setTag(R.id.robin_x_filter_script, script)
     }
@@ -134,11 +124,14 @@ object XFilterInjector {
         settings: FilterSettings,
         fontScale: Float = 1f,
     ) {
+        if (!WebUrlPolicy.isFeedUrl(webView.url)) return
         val json = settings.toJsonObjectLiteral(fontScale)
+        val trustedOrigins = trustedOriginArray()
         webView.evaluateJavascript(
             """
-            window.__ROBIN_SETTINGS__ = $json;
             (function(){
+              if (window.top !== window || $trustedOrigins.indexOf(location.origin) === -1) return;
+              window.__ROBIN_SETTINGS__ = $json;
               var href = (location.href || '').toLowerCase();
               var path = (location.pathname || '').toLowerCase();
               if (path.indexOf('/i/flow/') === 0 || href.indexOf('/i/flow/') !== -1 ||
@@ -179,17 +172,23 @@ object XFilterInjector {
               if (typeof scale !== 'number' || !(scale > 0)) scale = 1;
               if (scale === 1) root.style.removeProperty('zoom');
               else root.style.zoom = String(scale);
+              if (typeof window.__ROBIN_ON_SETTINGS__ === 'function') window.__ROBIN_ON_SETTINGS__();
             })();
-            if (typeof window.__ROBIN_ON_SETTINGS__ === 'function') window.__ROBIN_ON_SETTINGS__();
             """.trimIndent(),
             null,
         )
     }
 
     fun evaluateIfNeeded(webView: WebView) {
+        if (!WebUrlPolicy.isFeedUrl(webView.url)) return
         val script = webView.getTag(R.id.robin_x_filter_script) as? String ?: return
         webView.evaluateJavascript(script, null)
     }
+
+    private fun trustedOriginArray(): String =
+        WebUrlPolicy.feedOrigins.sorted().joinToString(prefix = "[", postfix = "]") {
+            jsonStringLiteral(it)
+        }
 
     private fun readAsset(context: Context, path: String): String {
         context.assets.open(path).use { input ->

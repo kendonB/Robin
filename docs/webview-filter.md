@@ -1,5 +1,7 @@
 # WebView filter (Android + iOS)
 
+> **Android security changes in this fork:** [android-security.md](android-security.md) describes the current origin-scoped bridge, strict navigation, default-off AI and removed telemetry. The upstream platform overview below also describes iOS and historical behaviour; use the Android security guide for Android trust and build decisions.
+
 Primary mobile UI is an in-app `x.com` session with an injected filter core (Following by default, optional For You; hide ads / page chrome), adapted from [minimal-twitter](https://github.com/typefully/minimal-twitter) (MIT).
 
 Desktop remains a normal browser + extension (out of scope).

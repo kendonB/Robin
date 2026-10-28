@@ -1,9 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.HIDE_OVERLAY_WINDOWS" />
 
     <!--
       Android 11+ package visibility: WebView’s selection ActionMode queries
@@ -20,6 +22,8 @@
     <application
         android:name=".RobinApplication"
         android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="false"
         android:enableOnBackInvokedCallback="true"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher"
@@ -29,9 +33,13 @@
         android:theme="@style/Theme.Robin"
         android:usesCleartextTraffic="false">
 
-        <!-- Init only in RobinApplication (manual SentryAndroid.init). -->
+        <!-- AI is explicitly opt-in; no cloud initialisation via providers. -->
+        <provider
+            android:name="com.google.firebase.provider.FirebaseInitProvider"
+            android:authorities="${applicationId}.firebaseinitprovider"
+            tools:node="remove" />
         <meta-data
-            android:name="io.sentry.auto-init"
+            android:name="firebase_data_collection_default_enabled"
             android:value="false" />
 
         <activity

@@ -4,11 +4,8 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
     id("org.jetbrains.kotlin.plugin.serialization")
-    id("io.sentry.android.gradle")
-    id("com.google.gms.google-services")
 }
 
 val localProperties = Properties().apply {
@@ -21,62 +18,17 @@ val keystoreProperties = Properties().apply {
     if (f.exists()) FileInputStream(f).use { load(it) }
 }
 
-// Optional — empty / placeholder ⇒ Sentry disabled at runtime (safe for forks).
-fun sanitizeSentryDsn(raw: String?): String {
-    val dsn = (raw ?: "").trim()
-    if (dsn.isEmpty()) return ""
-    if (dsn.contains("YOUR_", ignoreCase = true)) return ""
-    if (!dsn.startsWith("http://") && !dsn.startsWith("https://")) return ""
-    return dsn
+// Merely placing Google Services configuration beside the source does not opt in.
+val enableAiSetting = (providers.gradleProperty("robin.enableAi").orNull
+    ?: localProperties.getProperty("robin.enableAi") ?: "false").trim()
+val enableAi = enableAiSetting.toBooleanStrictOrNull()
+    ?: error("robin.enableAi must be exactly true or false")
+if (enableAi) {
+    check(file("google-services.json").isFile) {
+        "AI is enabled: supply your own app/google-services.json and configure Firebase App Check."
+    }
+    apply(plugin = "com.google.gms.google-services")
 }
-
-fun sanitizeAptabaseAppKey(raw: String?): String {
-    val key = (raw ?: "").trim()
-    if (key.isEmpty()) return ""
-    if (key.contains("YOUR_", ignoreCase = true)) return ""
-    if (!key.startsWith("A-", ignoreCase = true)) return ""
-    return key
-}
-
-fun sanitizeAptabaseHost(raw: String?): String {
-    val host = (raw ?: "").trim().trimEnd('/')
-    if (host.isEmpty()) return ""
-    if (host.contains("YOUR_", ignoreCase = true)) return ""
-    if (!host.startsWith("http://") && !host.startsWith("https://")) return ""
-    return host
-}
-
-fun escapeBuildConfigString(value: String): String =
-    value.replace("\\", "\\\\").replace("\"", "\\\"")
-
-val sentryDsnRaw: String =
-    sanitizeSentryDsn(
-        localProperties.getProperty("sentry.dsn") ?: System.getenv("SENTRY_DSN"),
-    )
-val sentryEnabled = sentryDsnRaw.isNotEmpty()
-val sentryDsn: String = escapeBuildConfigString(sentryDsnRaw)
-
-val aptabaseAppKey: String =
-    escapeBuildConfigString(
-        sanitizeAptabaseAppKey(
-            localProperties.getProperty("aptabase.appKey")
-                ?: System.getenv("APTABASE_APP_KEY"),
-        ),
-    )
-val aptabaseHost: String =
-    escapeBuildConfigString(
-        sanitizeAptabaseHost(
-            localProperties.getProperty("aptabase.host")
-                ?: System.getenv("APTABASE_HOST"),
-        ),
-    )
-
-val appCheckDebugToken: String =
-    escapeBuildConfigString(
-        (localProperties.getProperty("appcheck.debugToken")
-            ?: System.getenv("APP_CHECK_DEBUG_TOKEN")
-            ?: "").trim(),
-    )
 
 // Debug Settings sheet chrome (benchmark / debug tests). Default on; set
 // robin.showDebugSettings=false in local.properties for release-looking screen recordings.
@@ -95,12 +47,9 @@ android {
         applicationId = "org.evergreenlabs.robin"
         minSdk = 33
         targetSdk = 36
-        versionCode = 59
-        versionName = "0.2.30"
-        buildConfigField("String", "SENTRY_DSN", "\"$sentryDsn\"")
-        buildConfigField("String", "APTABASE_APP_KEY", "\"$aptabaseAppKey\"")
-        buildConfigField("String", "APTABASE_HOST", "\"$aptabaseHost\"")
-        buildConfigField("String", "APP_CHECK_DEBUG_TOKEN", "\"$appCheckDebugToken\"")
+        versionCode = 60
+        versionName = "0.2.31-hardened"
+        buildConfigField("boolean", "ENABLE_AI", enableAi.toString())
         // Release buildTypes override this to false below.
         buildConfigField("boolean", "SHOW_DEBUG_SETTINGS", "$showDebugSettings")
     }
@@ -132,7 +81,9 @@ android {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
-            signingConfig = signingConfigs.getByName("release")
+            // Without the owner's keystore, produce an unsigned artifact for inspection.
+            // Never silently sign Release with a development debug keystore.
+            signingConfig = signingConfigs.getByName("release").takeIf { it.storeFile != null }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
@@ -151,6 +102,10 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
+
+    testOptions {
+        unitTests.isReturnDefaultValues = false
+    }
 }
 
 kotlin {
@@ -166,7 +121,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
-    implementation("androidx.webkit:webkit:1.12.1")
+    implementation("androidx.webkit:webkit:1.18.0")
     implementation("androidx.browser:browser:1.8.0")
     implementation("com.google.android.material:material:1.12.0")
     implementation("androidx.datastore:datastore-preferences:1.1.1")
@@ -180,32 +135,28 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     debugImplementation("androidx.compose.ui:ui-tooling")
 
-    implementation(platform("io.sentry:sentry-bom:8.33.0"))
-    implementation("io.sentry:sentry-android")
-
-    implementation("com.github.aptabase:aptabase-kotlin:0.0.8")
-
     implementation(platform("com.google.firebase:firebase-bom:34.16.0"))
     implementation("com.google.firebase:firebase-ai")
     implementation("com.google.firebase:firebase-appcheck")
     implementation("com.google.firebase:firebase-appcheck-playintegrity")
-    debugImplementation("com.google.firebase:firebase-appcheck-debug")
 
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
+
+    testImplementation("junit:junit:4.13.2")
+
+    // These are tools used by lint, not app runtime dependencies. Keep their
+    // transitive libraries above the reviewed security-fix versions.
+    constraints {
+        add("androidLintTool", "com.google.guava:guava:33.7.2-jre")
+        add("androidLintTool", "org.apache.commons:commons-lang3:3.18.0")
+        add("androidLintTool", "org.apache.httpcomponents:httpclient:4.5.14")
+        add("androidLintTool", "org.bouncycastle:bcprov-jdk18on:1.86")
+        add("androidLintTool", "org.bouncycastle:bcpkix-jdk18on:1.86")
+        add("androidLintTool", "org.bouncycastle:bcutil-jdk18on:1.86")
+    }
 }
 
-sentry {
-    // Never require Sentry credentials for a local/fork build.
-    // Token alone is not enough — sentry-cli also needs org + project.
-    autoUploadProguardMapping.set(
-        sentryEnabled &&
-            !System.getenv("SENTRY_AUTH_TOKEN").isNullOrBlank() &&
-            !System.getenv("SENTRY_ORG").isNullOrBlank() &&
-            !System.getenv("SENTRY_PROJECT").isNullOrBlank(),
-    )
-    includeSourceContext.set(false)
-    telemetry.set(false)
-    tracingInstrumentation {
-        enabled.set(sentryEnabled)
-    }
+dependencyLocking {
+    lockAllConfigurations()
+    lockMode.set(LockMode.STRICT)
 }

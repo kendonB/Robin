@@ -1,11 +1,15 @@
 # Android client
 
-Primary UI is an **x.com WebView** with injected filters (Following by default / optional For You; hide promoted posts). Package: `org.evergreenlabs.robin`. X sign-in is the WebView cookie session (no Robin backend). See [`docs/webview-filter.md`](webview-filter.md).
+The Android app embeds X with local feed filters. This fork hardens that session and its native boundaries. Read [the Android security guide](android-security.md) before using a primary account. Package: `org.evergreenlabs.robin`.
 
 ## Requirements
 
-- Android Studio Ladybug+ (or SDK 36 + JDK 17)
-- Device or emulator **API 33+**
+- JDK 17 and Android SDK 36, with build-tools 36.0.0 and current command-line tools.
+- Android Studio compatible with the pinned Android Gradle Plugin (if using the IDE).
+- Device **API 33+** with an up-to-date system WebView.
+- Python 3 for the Release APK verification script.
+
+Gradle, AGP, Kotlin and resolved dependency versions are pinned in the repository. Use the checked-in wrapper with dependency verification enabled.
 
 ## Configure
 
@@ -13,68 +17,77 @@ Primary UI is an **x.com WebView** with injected filters (Following by default /
 cp android/local.properties.example android/local.properties
 ```
 
-Edit `android/local.properties`:
+Set the local SDK directory in that private file, or supply `ANDROID_SDK_ROOT`:
 
 ```properties
-sdk.dir=/Users/YOU/Library/Android/sdk
-# Optional — omit or leave blank to disable Sentry (recommended for forks)
-# sentry.dsn=https://YOUR_PUBLIC_KEY@oXXXX.ingest.us.sentry.io/PROJECT_ID
-# Optional Aptabase — leave blank to disable (recommended for forks)
-# aptabase.appKey=A-SH-YOUR_APP_KEY
-# aptabase.host=https://YOUR_APTABASE_HOST
+sdk.dir=/absolute/path/to/Android/sdk
+robin.enableAi=false
 ```
 
-`sentry.dsn` (or env `SENTRY_DSN`) becomes `BuildConfig.SENTRY_DSN`. `aptabase.appKey` / `aptabase.host` (or `APTABASE_APP_KEY` / `APTABASE_HOST`) become BuildConfig fields; empty / placeholder ⇒ Aptabase stays fully disabled. `robin.showDebugSettings` (default `true` in debug; always off in release) controls Settings debug chrome (benchmark) — set `false` for release-looking screen recordings. Do not commit `local.properties`.
+The default build needs no Firebase configuration and contains no Sentry/Aptabase integration. `robin.showDebugSettings` controls development benchmark settings; Release always disables them. Never commit `local.properties`.
 
-## Run
+For AI, explicitly set `robin.enableAi=true` and add your own `android/app/google-services.json`. Configure server-side App Check enforcement, API restrictions and quotas. Debug and Release both require real Play Integrity attestation when AI is enabled; this fork removes the App Check debug provider and ignores debug tokens. Every fact-check still requires native confirmation. Read the [AI security and sideloading limitations](android-security.md#optional-ai-explicit-setup-and-per-request-consent).
+
+## Verify the build
 
 ```bash
 cd android
-./gradlew :app:assembleDebug
-./gradlew :app:installDebug
+APP_CHECK_DEBUG_TOKEN=ROBIN_RELEASE_TOKEN_MUST_NOT_SHIP ./gradlew --no-daemon testDebugUnitTest lintRelease assembleDebug assembleRelease
+cd ..
+python3 scripts/verify-android-release.py \
+  --apk android/app/build/outputs/apk/release/app-release-unsigned.apk \
+  --apkanalyzer "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/apkanalyzer"
 ```
 
-## Behavior
+Without a private signing configuration the Release APK is deliberately unsigned. The Debug APK is useful for development, but it is Android-debuggable and uses the development debug keystore. Use a privately signed **Release** for your normal signed-in session.
 
-| Concern | How |
-|--------|-----|
-| Feed | `x.com` WebView + `assets/x-filter` inject (Following or For You from Settings, hide ads / page header) |
-| Sign in | On x.com inside the WebView (cookie session) |
-| Settings | Gear → text size, filter toggles, sign out (clears X cookies) |
-| Theme | Material 3 light/dark following system; brand blue accent |
+## Sign a personal Release
 
-## Play release (AAB)
+Create a private signing key on your own trusted computer and keep a backed-up copy outside the source tree. Android's `keytool` prompts for the passwords:
 
-1. Create `android/keystore.properties` (gitignored):
+```bash
+keytool -genkeypair -v -keystore /private/path/robin-personal.jks \
+  -alias robin -keyalg RSA -keysize 3072 -validity 10000
+```
+
+Create gitignored `android/keystore.properties` with the private location and passwords:
 
 ```properties
-storeFile=/absolute/path/to/robin-upload.jks
-storePassword=…
+storeFile=/private/path/robin-personal.jks
+storePassword=YOUR_PRIVATE_PASSWORD
 keyAlias=robin
-keyPassword=…
+keyPassword=YOUR_PRIVATE_PASSWORD
 ```
 
-2. Optionally set `sentry.dsn` in `android/local.properties`, or export `SENTRY_DSN` in your environment.
-
-3. Build the Play App Bundle:
+Build and inspect the signed artifact:
 
 ```bash
 cd android
-./gradlew :app:bundleRelease
+./gradlew --no-daemon :app:assembleRelease
+cd ..
+python3 scripts/verify-android-release.py \
+  --apk android/app/build/outputs/apk/release/app-release.apk \
+  --apkanalyzer "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/apkanalyzer"
 ```
 
-Output: `android/app/build/outputs/bundle/release/app-release.aab`
+Keep the same private key for later updates. A self-signed fork cannot update an installed upstream store build signed by a different key. Test on a device before moving a primary session. No keystore or signing password belongs in a PR, CI artifact, chat transcript or public log.
 
-Upload that AAB to Play Console → Testing → Internal testing (or use `fastlane android beta`). First upload requires creating the Play app for `org.evergreenlabs.robin` and enrolling in Play App Signing.
+## Behaviour
 
-## Store listing graphics
+| Concern | Android behaviour |
+|---|---|
+| Feed | X WebView with local Following/For You and content filters |
+| Sign-in | Exact supported HTTPS origins; visible native origin indicator; unknown redirects fail closed |
+| External links | Validated HTTPS URLs opened in a system browser |
+| AI | Disabled unless explicitly configured; native consent before each request |
+| Telemetry | Sentry/Aptabase removed |
+| Session | Private WebView cookie store; local sign-out; excluded from cloud backup/device transfer |
+| Screen | Screenshots/screen sharing and overlay windows blocked |
+| Debug features | Development only; no exported benchmark broadcast receiver; WebView inspection disabled |
 
-Prebuilt assets live in `android/play-store/`:
+## Play bundle
 
-- App icon: `icon/icon-512.png` (512×512)
-- Feature graphic: `feature-graphic/feature-graphic-1024x500.png` (1024×500)
-- Phone screenshots: `screenshots/phone/*.png`
-- Tablet screenshots: `screenshots/tablet/*.png` (Medium_Tablet AVD, landscape + portrait)
+With your own valid signing configuration, `./gradlew :app:bundleRelease` builds an AAB. Publishing and Play App Signing require an account/app identity you control. Existing upstream store listings and binaries are not automatically changed by this fork.
 
 ---
 

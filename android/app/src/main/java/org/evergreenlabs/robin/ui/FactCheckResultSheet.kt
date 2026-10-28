@@ -1,12 +1,9 @@
 package org.evergreenlabs.robin.ui
 
-import android.annotation.SuppressLint
 import android.net.Uri
-import android.webkit.WebView
 import androidx.browser.customtabs.CustomTabsIntent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
@@ -27,6 +24,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.ModalBottomSheetProperties
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
@@ -43,12 +41,18 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.SecureFlagPolicy
+import kotlinx.coroutines.CancellationException
+import org.evergreenlabs.robin.BuildConfig
+import org.evergreenlabs.robin.firebase.FactCheckException
 import org.evergreenlabs.robin.firebase.FactCheckFinding
 import org.evergreenlabs.robin.firebase.FactCheckFindingStatus
 import org.evergreenlabs.robin.firebase.FactCheckResult
 import org.evergreenlabs.robin.firebase.GenerativeAIService
 import org.evergreenlabs.robin.firebase.SourceCredibilityRating
+import org.evergreenlabs.robin.security.FactCheckInputPolicy
+import org.evergreenlabs.robin.security.ProtectDialogWindow
+import org.evergreenlabs.robin.security.WebUrlPolicy
 
 data class FactCheckRequest(
     val text: String,
@@ -66,32 +70,42 @@ fun FactCheckSheet(
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val context = LocalContext.current
 
-    var isLoading by remember { mutableStateOf(true) }
-    var result by remember { mutableStateOf<FactCheckResult?>(null) }
-    var errorMessage by remember { mutableStateOf<String?>(null) }
-    var retryCount by remember { mutableStateOf(0) }
+    val input = remember(request) {
+        FactCheckInputPolicy.validate(request.text, request.author, request.tweetURL, request.externalLinks)
+    }
+    var isLoading by remember(request) { mutableStateOf(false) }
+    var result by remember(request) { mutableStateOf<FactCheckResult?>(null) }
+    var errorMessage by remember(request) { mutableStateOf<String?>(null) }
+    // Only a native button changes this. Merely opening/replacing the sheet sends nothing.
+    var submissionCount by remember(request) { mutableStateOf(0) }
 
     fun openUrl(url: String) {
+        val safeUrl = WebUrlPolicy.safeHttpsUrl(url) ?: return
         runCatching {
             val customTabsIntent = CustomTabsIntent.Builder().setShowTitle(true).build()
-            customTabsIntent.launchUrl(context, Uri.parse(url))
+            customTabsIntent.launchUrl(context, Uri.parse(safeUrl))
         }
     }
 
-    LaunchedEffect(request, retryCount) {
+    LaunchedEffect(request, submissionCount) {
+        if (submissionCount == 0 || !BuildConfig.ENABLE_AI || input == null) return@LaunchedEffect
         isLoading = true
         errorMessage = null
         try {
             val outcome = GenerativeAIService.factCheckTweet(
-                text = request.text,
-                author = request.author,
-                tweetURL = request.tweetURL,
-                externalLinks = request.externalLinks,
+                text = input.text,
+                author = input.author,
+                tweetURL = input.tweetURL,
+                externalLinks = input.externalLinks,
             )
             result = outcome.result
-            isLoading = false
-        } catch (e: Exception) {
-            errorMessage = e.localizedMessage ?: "Fact check failed."
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (safe: FactCheckException) {
+            errorMessage = safe.message
+        } catch (_: Exception) {
+            errorMessage = "The fact check is unavailable. You can choose to send it again."
+        } finally {
             isLoading = false
         }
     }
@@ -100,7 +114,9 @@ fun FactCheckSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState,
         containerColor = MaterialTheme.colorScheme.surface,
+        properties = ModalBottomSheetProperties(securePolicy = SecureFlagPolicy.SecureOn),
     ) {
+        ProtectDialogWindow()
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -120,7 +136,7 @@ fun FactCheckSheet(
                         style = MaterialTheme.typography.titleLarge,
                         fontWeight = FontWeight.SemiBold,
                     )
-                    request.author?.takeIf { it.isNotBlank() }?.let {
+                    input?.author?.let {
                         Text(
                             text = it,
                             style = MaterialTheme.typography.bodySmall,
@@ -134,6 +150,42 @@ fun FactCheckSheet(
             }
 
             when {
+                !BuildConfig.ENABLE_AI -> {
+                    Text("Fact-checking is disabled in this build. No post has been sent.")
+                }
+                input == null -> {
+                    Text("This post is too long or contains unsupported links. No post has been sent.")
+                }
+                submissionCount == 0 -> {
+                    Text(
+                        text = "Send this post for fact-checking?",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        "The text below, author, post permalink and listed links will be sent to Google " +
+                            "for analysis with Google Search. Your X cookies and password are not included.",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    if (input.externalLinks.isNotEmpty()) {
+                        Text(
+                            "Robin also downloads publisher ratings from evergreen-labs.org. Linked pages are not fetched by Robin.",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    FactCheckSection(title = "Post to send") {
+                        Text(input.text, style = MaterialTheme.typography.bodyMedium)
+                        input.tweetURL?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+                        input.externalLinks.forEach { Text(it, style = MaterialTheme.typography.bodySmall) }
+                    }
+                    Button(onClick = {
+                        if (!isLoading) {
+                            isLoading = true
+                            submissionCount++
+                        }
+                    }) { Text("Send to Google") }
+                    TextButton(onClick = onDismiss) { Text("Cancel") }
+                }
                 isLoading -> {
                     Column(
                         modifier = Modifier
@@ -144,7 +196,7 @@ fun FactCheckSheet(
                     ) {
                         CircularProgressIndicator(modifier = Modifier.size(48.dp))
                         Text(
-                            text = "Analyzing claims with Gemini 3.8 Flash…",
+                            text = "Analysing claims with Gemini 3.8 Flash…",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Medium,
                         )
@@ -180,8 +232,13 @@ fun FactCheckSheet(
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                         Spacer(modifier = Modifier.height(8.dp))
-                        Button(onClick = { retryCount++ }) {
-                            Text("Try Again")
+                        Button(onClick = {
+                            if (!isLoading) {
+                                isLoading = true
+                                submissionCount++
+                            }
+                        }) {
+                            Text("Send Again")
                         }
                     }
                 }
@@ -285,8 +342,9 @@ fun FactCheckSheet(
                     val suggestionsHtml = res.searchSuggestionsHTML
                     if (!suggestionsHtml.isNullOrBlank()) {
                         FactCheckSection(title = "Google Search suggestions") {
-                            SearchSuggestionsWebView(
+                            FactCheckSearchSuggestions(
                                 html = suggestionsHtml,
+                                onOpenUrl = ::openUrl,
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .heightIn(min = 72.dp),
@@ -325,7 +383,6 @@ private fun FactCheckSection(
         )
     }
 }
-
 @Composable
 private fun FindingRow(finding: FactCheckFinding) {
     val chipColors = findingStatusColors(finding.status)
@@ -424,53 +481,4 @@ private fun RatingRow(label: String, value: String) {
             fontWeight = FontWeight.Medium,
         )
     }
-}
-
-@SuppressLint("SetJavaScriptEnabled")
-@Composable
-private fun SearchSuggestionsWebView(
-    html: String,
-    modifier: Modifier = Modifier,
-) {
-    AndroidView(
-        modifier = modifier,
-        factory = { context ->
-            WebView(context).apply {
-                settings.javaScriptEnabled = true
-                setBackgroundColor(android.graphics.Color.TRANSPARENT)
-                webViewClient = object : android.webkit.WebViewClient() {
-                    override fun shouldOverrideUrlLoading(
-                        view: WebView?,
-                        request: android.webkit.WebResourceRequest?,
-                    ): Boolean {
-                        val url = request?.url?.toString().orEmpty()
-                        if (url.startsWith("http://") || url.startsWith("https://")) {
-                            runCatching {
-                                val customTabsIntent = CustomTabsIntent.Builder().setShowTitle(true).build()
-                                customTabsIntent.launchUrl(context, Uri.parse(url))
-                            }
-                            return true
-                        }
-                        return false
-                    }
-                }
-                loadDataWithBaseURL(
-                    "https://www.google.com",
-                    html,
-                    "text/html",
-                    "UTF-8",
-                    null,
-                )
-            }
-        },
-        update = { webView ->
-            webView.loadDataWithBaseURL(
-                "https://www.google.com",
-                html,
-                "text/html",
-                "UTF-8",
-                null,
-            )
-        },
-    )
 }

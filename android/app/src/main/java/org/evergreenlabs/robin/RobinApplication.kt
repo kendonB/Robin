@@ -1,37 +1,16 @@
 package org.evergreenlabs.robin
 
 import android.app.Application
-import android.util.Log
-import io.sentry.android.core.SentryAndroid
+import org.evergreenlabs.robin.firebase.FirebaseBootstrap
 
 class RobinApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         AppGraph.init(this)
-        Analytics.init(this)
-        org.evergreenlabs.robin.firebase.FirebaseBootstrap.configure(this)
-        configureSentry()
-    }
-
-    private fun configureSentry() {
-        val dsn = BuildConfig.SENTRY_DSN.trim()
-        if (dsn.isEmpty()) {
-            Log.i(TAG, "Sentry disabled (optional; set sentry.dsn or SENTRY_DSN to enable)")
-            return
+        // FirebaseInitProvider is removed from the merged manifest. A normal
+        // personal build must not initialise a cloud SDK merely by starting.
+        if (BuildConfig.ENABLE_AI) {
+            FirebaseBootstrap.configure(this)
         }
-
-        SentryAndroid.init(this) { options ->
-            options.dsn = dsn
-            options.environment = BuildConfig.BUILD_TYPE
-            options.release =
-                "${BuildConfig.APPLICATION_ID}@${BuildConfig.VERSION_NAME}+${BuildConfig.VERSION_CODE}"
-            options.tracesSampleRate = if (BuildConfig.DEBUG) 1.0 else 0.2
-            options.isAnrEnabled = true
-            options.isDebug = BuildConfig.DEBUG
-        }
-    }
-
-    companion object {
-        private const val TAG = "Robin"
     }
 }
